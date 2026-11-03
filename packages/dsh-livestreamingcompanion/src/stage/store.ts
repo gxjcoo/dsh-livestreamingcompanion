@@ -356,6 +356,11 @@ function short(text: string, max = 22): string {
   return chars.length > max ? `${chars.slice(0, max).join('')}…` : text;
 }
 
+/** 终端里的说话内容最多保留 100 字；完整字幕仍走独立的字幕挂件 */
+export function terminalSpeech(text: string): string {
+  return short(text, 100);
+}
+
 const MOOD_TEXT: Record<string, string> = { laugh: '笑', shy: '害羞', angry: '生气', sad: '难过', scared: '害怕', shocked: '吃惊', think: '想' };
 
 // ── 开播、下播 ─────────────────────────────────────────
@@ -506,7 +511,7 @@ function handle(event: StageEvent): void {
       if (demo && !demoStarted) startDemo(event.character.name);
       return;
     case 'say':
-      update((s) => term(s, event.speaker ? 'guest' : 'say', `${event.speaker ? `${event.speaker}：` : ''}${MOOD_TEXT[event.mood] ? `（${MOOD_TEXT[event.mood]}）` : ''}${short(event.text, 26)}`));
+      update((s) => term(s, event.speaker ? 'guest' : 'say', `${event.speaker ? `${event.speaker}：` : ''}${MOOD_TEXT[event.mood] ? `（${MOOD_TEXT[event.mood]}）` : ''}${terminalSpeech(event.text)}`));
       return onSay(event);
     case 'brain': return onBrain(event);
     case 'tool': return update((s) => term({ ...s, brain: 'thinking', brainDetail: event.doing ?? s.brainDetail }, 'tool', `${event.name}${event.detail ? ` ${event.detail}` : ''}`));
@@ -517,13 +522,8 @@ function handle(event: StageEvent): void {
       update((s) => ({ ...s, online: event.online, stats: { ...s.stats, peakOnline: Math.max(s.stats.peakOnline, event.online ?? 0) } }));
       return onAirChanged(event.onAir);
     case 'usage':
-      return update((s) => {
-        const next = { ...s, tokens: event.tokens, model: event.model ?? s.model };
-        // 观众看不懂「+20,863」（以为是加了 token），也老问「吃了多少钱」：写成这一步吃掉多少、折成米粒和电，再加今晚一共吃了多少米（不算钱）
-        if (!event.turn) return next;
-        const step = riceOf(event.turn);
-        return term(next, 'token', `这一步吃掉 ${tokenCount(event.turn)} token ≈ ${Math.max(1, step.grainsOf(event.turn))} 粒米、${energy(step.joules)}电 · 这场共 ${riceOf(event.tokens).grains.toLocaleString()} 粒米`);
-      });
+      // 只更新饭量挂件和谢幕统计，不再往终端聊天框里插入饭量记录
+      return update((s) => ({ ...s, tokens: event.tokens, model: event.model ?? s.model }));
     case 'media':
       if (event.action === 'play') {
         const { id, title, up, src, from, until, at } = event;

@@ -879,7 +879,7 @@ function clock(at: number): string {
   return [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, '0')).join(':');
 }
 
-/** 终端：身体推了什么给她、她说了什么、用了多少 token——观众看得见 AI 在干活 */
+/** 终端：身体推了什么给她、她说了什么——观众看得见 AI 在干活 */
 export function Terminal({ options }: { options?: Record<string, unknown> }) {
   const { term, brain, brainDetail, character } = useStage();
   const art = useArt('laptop');

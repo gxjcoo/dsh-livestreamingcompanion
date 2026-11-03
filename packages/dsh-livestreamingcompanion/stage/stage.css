@@ -722,6 +722,8 @@ html, body {
 .ls-term-line time { display: none; flex: none; color: #6c77a3; }
 .ls-term-line b { flex: none; font-weight: 700; color: #8fc7ff; }
 .ls-term-line span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 说话内容最多 100 字，允许换行；工具日志等仍保持单行，避免撑满终端 */
+.ls-tag-say span, .ls-tag-guest span { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
 .ls-tag-say b { color: #ffa8c9; }
 .ls-tag-tool b { color: #8fc7ff; }
 .ls-tag-tool span { color: #cfe6ff; font-family: Consolas, 'Cascadia Mono', monospace; }
