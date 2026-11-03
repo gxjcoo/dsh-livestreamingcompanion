@@ -23,6 +23,7 @@ import { BiliRoom } from '../body/biliRoom';
 import { screenshot } from '../body/obs';
 import { whoIs } from '../body/biliLogin';
 import { COMMENT_GAP_MS, FAVORITE_FOLDER, MAX_COMMENT_CHARS } from '../body/social';
+import { playMinecraft, type LiveGameBody } from './gameBridge';
 
 export const name = 'dsh-livestreamingcompanion-agent';
 export const inject = ['tools'];
@@ -757,12 +758,32 @@ ${profileText(profile)}` : '没打开自己的主页（B 站没返回，可能�
     },
   })), 'stop_video tool');
 
+  // 直播插件真正调用 dsh-game 开局；开好后仍交给游戏线持续操作，避免长游戏循环堵住直播互动
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 'play_minecraft',
+    description: '用 dsh-game 打开 Minecraft 或接着玩当前世界，可直接带上这次要玩的目标。返回真实开局结果；只有成功后才算开始玩。换目标、临时换做法或停手用 game_side。',
+    parameters: {
+      goal: { type: 'string', description: '这次在 Minecraft 里要做什么，比如「先砍树做工具，再找煤矿」；不填就接着当前世界玩' },
+    },
+    output: stringOut,
+    async execute(args) {
+      const goal = typeof args.goal === 'string' ? args.goal.trim() : '';
+      show.toolCall('play_minecraft', goal.slice(0, 40) || 'Minecraft');
+      return playMinecraft({
+        body: ctx.get?.('gameBody') as LiveGameBody | undefined,
+        gameSession: show.currentGameSession,
+        goal,
+        handoff: (text) => show.toGameLine(text),
+      });
+    },
+  })), 'play_minecraft tool');
+
   // 游戏线：另一个会话里的她专门玩游戏，这条线把话交给她
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'game_side',
-    description: '定下游戏里接下来怎么玩：开游戏、换目标、照观众的主意换个做法、停手。写下来，游戏里接下来就照着做（具体怎么做看游戏里的情况），做的事和说的话观众都看得到。',
+    description: '给已经打开的游戏换目标、照观众的主意换个做法或停手。开 Minecraft 必须用 play_minecraft，不要用这个工具代替开局。',
     parameters: {
-      message: { type: 'string', required: true, description: '接下来怎么玩，比如「开 Minecraft 接着玩，目标一身钻石装备」「观众提醒天黑了：先挖洞躲起来」' },
+      message: { type: 'string', required: true, description: '接下来怎么玩，比如「目标改成一身钻石装备」「观众提醒天黑了：先挖洞躲起来」「停下现在的动作」' },
     },
     output: stringOut,
     async execute(args) {

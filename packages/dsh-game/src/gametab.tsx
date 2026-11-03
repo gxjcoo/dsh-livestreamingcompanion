@@ -282,18 +282,51 @@ function useGallery(): { id: number; label: string; at: number }[] {
   return items;
 }
 
+/** Minecraft 摄像机窗口的实时画面，走和其他游戏相同的 JPEG 帧事件 */
+function LiveClientScreen({ title, note, error, viewButtons, hasGallery, onGallery, onLive }: {
+  title: string;
+  note: string;
+  error: string;
+  viewButtons: React.ReactNode;
+  hasGallery: boolean;
+  onGallery: () => void;
+  onLive: (live: boolean) => void;
+}) {
+  const [live, setLive] = useState(false);
+  const ref = useRef<HTMLImageElement>(null);
+  useEffect(() => onLive(live), [live, onLive]);
+  useFrames((frame) => {
+    if (ref.current) ref.current.src = frame;
+    setLive(true);
+  });
+  return (
+    <div className="dg-screen dg-screen-client">
+      <div className="dg-gallery-top" title={note}>
+        <span><b>{title}</b> · 实时画面</span>
+        {hasGallery && <button className="dg-stop dg-tool dg-gallery-toggle" onClick={onGallery}>图纸</button>}
+        {viewButtons}
+      </div>
+      {!live && <div className="dg-client-wait"><b>正在连接摄像机画面…</b><p>{note}</p></div>}
+      <img ref={ref} alt={`${title}实时画面`} style={live ? undefined : { display: 'none' }} />
+      {error && <p className="dg-client-error">{error}</p>}
+    </div>
+  );
+}
+
 /**
- * 画面在游戏客户端窗口里（Minecraft 摄像机）：说明 + 视角切换（往那个窗口发 F5，不用碰它）。
- * 她看过图（图纸的渲染图、切开图、地形图）时，这块地方显示她最新看到的那张，下面一排是前几张，点了看那张（点最新的回到跟着最新）
+ * Minecraft：默认直接看摄像机客户端的实时画面，视角按钮会切机位并回到实时画面。
+ * 图纸的渲染图、切开图、地形图收进「图纸」视图，不再把实时游戏画面盖掉。
  */
-function ClientScreen({ title, note, perspective }: { title: string; note: string; perspective: string | null }) {
+function ClientScreen({ title, note, perspective, onLive }: { title: string; note: string; perspective: string | null; onLive: (live: boolean) => void }) {
   const gallery = useGallery();
+  const [galleryOpen, setGalleryOpen] = useState(false);
   const [picked, setPicked] = useState<number | null>(null);
   const [error, setError] = useState('');
   const pick = async (mode: string) => {
     setError('');
     const res = await fetch(`/api/dsh-game/view?mode=${mode}`, { method: 'POST' }).catch(() => null);
     if (!res?.ok) setError((await res?.text().catch(() => '')) || '切换失败');
+    else setGalleryOpen(false);
   };
   const views: [string, string][] = [['follow', '跟拍'], ['first', '她的视角'], ['back', '背后'], ['front', '正面']];
   const viewButtons = perspective && (
@@ -305,12 +338,12 @@ function ClientScreen({ title, note, perspective }: { title: string; note: strin
   );
   const latest = gallery[gallery.length - 1];
   const shown = gallery.find((g) => g.id === picked) ?? latest;
-  if (shown) {
+  if (galleryOpen && shown) {
     return (
       <div className="dg-screen dg-screen-gallery">
         <div className="dg-gallery-top" title={note}>
           <span><b>{shown.label}</b>{shown !== latest ? ' · 前几张' : ' · 她刚看到的'}</span>
-          <span className="dg-gallery-hint">游戏画面在客户端窗口里</span>
+          <button className="dg-stop dg-tool dg-gallery-toggle" onClick={() => setGalleryOpen(false)}>实时画面</button>
           {viewButtons}
         </div>
         <img className="dg-gallery-main" src={`/api/dsh-game/gallery-image?id=${shown.id}&t=${shown.at}`} alt={shown.label} />
@@ -325,14 +358,7 @@ function ClientScreen({ title, note, perspective }: { title: string; note: strin
       </div>
     );
   }
-  return (
-    <div className="dg-screen dg-screen-note">
-      <b>{`${title}的画面在游戏客户端窗口里`}</b>
-      <p>{note}</p>
-      {viewButtons}
-      {error && <p className="dg-client-error">{error}</p>}
-    </div>
-  );
+  return <LiveClientScreen title={title} note={note} error={error} viewButtons={viewButtons} hasGallery={!!latest} onGallery={() => setGalleryOpen(true)} onLive={onLive} />;
 }
 
 /** 这个标签开着时收起 DSH 默认的输入框卡片（审批 / 提问面板换掉输入框时，默认卡片本来就藏着，不受影响） */
@@ -408,8 +434,8 @@ export function GameView({ sessionId, events, send, stop, openSession }: GameTab
   } else if (showWolf) {
     screenBody = <div className="dg-screen dg-screen-wolf"><WolfTable colors={WOLF_COLORS} /></div>;
   } else if (state?.note) {
-    // 画面不在插件里（Minecraft：在摄像机客户端窗口里），给视角切换按钮
-    screenBody = <ClientScreen title={state.title ?? '游戏'} note={state.note} perspective={state.perspective ?? null} />;
+    // Minecraft：直接抓摄像机客户端窗口，在游戏页里看实时画面和切机位
+    screenBody = <ClientScreen title={state.title ?? '游戏'} note={state.note} perspective={state.perspective ?? null} onLive={setLive} />;
   } else {
     screenBody = <GameScreen onLive={setLive} />;
   }
@@ -521,14 +547,19 @@ html[data-dsh-game-view][data-dsh-game-theater] header:has([data-conversation-ta
 .dg-live[data-status=elsewhere]{color:#9fb6ec}
 .dg-stop[data-confirm]{color:#ffc2cb;border-color:rgba(255,150,170,.6);box-shadow:0 0 14px -5px rgba(255,140,165,.7)}
 .dg-screen-gallery{position:relative;background:#dfe4ec}
+.dg-screen-client{position:relative;background:#000}
+.dg-screen-client > img{object-fit:contain}
+.dg-client-wait{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:54px 24px 24px;text-align:center}
+.dg-client-wait b{font-size:14px;font-weight:500;color:#e8f0ff}
+.dg-client-wait p{margin:0;max-width:520px;font-size:12px;line-height:1.6;color:var(--dg-dim)}
+.dg-screen-client > .dg-client-error{position:absolute;left:12px;bottom:10px;margin:0;padding:4px 8px;border-radius:6px;background:rgba(6,10,22,.8)}
 .dg-screen .dg-gallery-main{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
-.dg-gallery-top{position:absolute;left:0;right:0;top:0;display:flex;align-items:center;gap:10px;padding:6px 10px;font-size:12px;color:#c9d4f0;background:linear-gradient(180deg,rgba(6,10,22,.85),rgba(6,10,22,0))}
+.dg-gallery-top{position:absolute;left:0;right:0;top:0;z-index:2;display:flex;align-items:center;gap:10px;padding:6px 10px;font-size:12px;color:#c9d4f0;background:linear-gradient(180deg,rgba(6,10,22,.85),rgba(6,10,22,0))}
 .dg-gallery-top > span:first-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .dg-gallery-top b{color:#fff;font-weight:500}
 .dg-gallery-top .dg-client-views{margin:0 0 0 auto;flex:none}
 .dg-gallery-top .dg-client-views button{padding:2px 7px}
-.dg-gallery-hint{font:10px var(--dg-mono);color:#9fb0d0;white-space:nowrap}
-@container (max-width:520px){.dg-gallery-hint{display:none}}
+.dg-gallery-toggle{flex:none;padding:2px 7px}
 .dg-gallery-strip{position:absolute;left:0;right:0;bottom:0;display:flex;gap:5px;padding:14px 8px 6px;overflow-x:auto;background:linear-gradient(0deg,rgba(6,10,22,.75),rgba(6,10,22,0))}
 .dg-gallery-strip button{flex:none;width:40px;height:40px;padding:0;border-radius:5px;border:1px solid rgba(255,255,255,.35);background:#dfe4ec;cursor:pointer;overflow:hidden;opacity:.75}
 .dg-gallery-strip button.on{opacity:1;border-color:rgba(134,220,255,.95);box-shadow:0 0 10px -2px rgba(134,220,255,.9)}

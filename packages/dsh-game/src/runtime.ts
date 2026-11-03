@@ -432,6 +432,7 @@ export const GAMES = {
         preflight: () => mcSetup.check().then((c) => c.problem),
         record,
         onAction: (text) => broadcast({ type: 'act', text, at: Date.now() }),
+        onFrame,
       });
     },
   },

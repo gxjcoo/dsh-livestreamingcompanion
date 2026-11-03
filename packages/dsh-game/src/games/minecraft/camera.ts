@@ -14,6 +14,7 @@ import type { MinecraftHudState } from './body/contracts.js';
 import { GameJar } from './gameJar.js';
 import { HudAssets, HudOverlay, hudPayload, releaseStaleClip } from './hudOverlay.js';
 import { HudPage } from './hudPage.js';
+import { CameraPreview } from './cameraPreview.js';
 
 export interface CameraOptions {
   /** 装好游戏的 .minecraft（里面有 versions/<版本>/） */
@@ -29,6 +30,8 @@ export interface CameraOptions {
   java: string;
   /** HUD 网页的端口（0 = 不开） */
   hudPort: number;
+  /** 游戏标签页的实时预览帧 */
+  onFrame?: (jpeg: Buffer) => void;
   log?: (text: string) => void;
 }
 
@@ -114,6 +117,8 @@ export class CameraClient {
   private hudAssets: HudAssets | null = null;
   private hud: HudOverlay | null = null;
   private hudPage: HudPage | null = null;
+  private preview: CameraPreview | null = null;
+  private streamFps = 0;
 
   constructor(private readonly options: CameraOptions) {}
 
@@ -134,6 +139,7 @@ export class CameraClient {
     launcher.on('close', (code: unknown) => {
       o.log?.(`[camera] client closed (${String(code)})`);
       this.pid = null;
+      this.stopPreview();
       this.stopHudSoon();
     });
     const child = await launcher.launch({
@@ -168,6 +174,7 @@ export class CameraClient {
         o.log?.(`[camera] no HUD: ${(err as Error).message}`);
       }
     }
+    this.setStream(this.streamFps);
   }
 
   /** HUD 画她现在的状态（摄像机窗口上的、HUD 网页上的） */
@@ -176,6 +183,22 @@ export class CameraClient {
     const text = hudPayload(this.hudAssets, state);
     this.hud?.write(text);
     this.hudPage?.push(text);
+  }
+
+  /** 游戏标签要看时才抓窗口；窗口捕获最多 10 帧，避免抢占游戏本身的渲染资源 */
+  setStream(fps: number): void {
+    this.streamFps = fps;
+    if (!fps || !this.pid || !this.options.onFrame) {
+      this.stopPreview();
+      return;
+    }
+    this.preview ??= new CameraPreview(this.options.gameDir, this.options.onFrame, this.options.log);
+    this.preview.start(this.pid, Math.min(10, fps));
+  }
+
+  private stopPreview(): void {
+    this.preview?.stop();
+    this.preview = null;
   }
 
   /** HUD 网页的地址（没开是 null） */
@@ -261,6 +284,7 @@ for ($i = 0; $i -lt ${times}; $i++) {
 
   stop(): void {
     this.closed = true;
+    this.stopPreview();
     // 先关游戏，HUD 窗口看到它退出会解开它留下的鼠标限制，再关 HUD
     this.killPid(this.pid);
     this.pid = null;

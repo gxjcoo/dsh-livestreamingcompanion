@@ -20,6 +20,7 @@ import { DEFAULT_VOICE } from './tts.js';
 import { deleteCharacter, findDdlcDir } from './games/ddlc/profile.js';
 import { WerewolfSession, devOptions } from './games/werewolf/session.js';
 import { releaseStaleClip } from './games/minecraft/hudOverlay.js';
+import { gameBody } from './liveBridge.js';
 
 export const name = 'dsh-game';
 
@@ -89,6 +90,8 @@ export function apply(ctx: HostContext, config: LiveConfig = {}): void {
     mcCameraName: config.mcCameraName?.get(),
     mcHudPort: config.mcHudPort?.get(),
   }));
+  // 直播插件可以直接开一局；owner 传游戏线会话，后续 game_continue / game_act 仍由那条会话执行
+  ctx.provide('gameBody', gameBody);
   // 直播插件（dsh-livestream）在的话，它提供直播身体：在播时她的话由它念，游戏画面由它放上舞台
   hooks.live = () => ctx.get?.('liveBody');
   ctx.effect(() => () => { hooks.live = undefined; }, 'dsh-game live body');

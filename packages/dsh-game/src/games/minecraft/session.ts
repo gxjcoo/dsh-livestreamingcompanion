@@ -38,6 +38,8 @@ export interface MinecraftOptions {
   record: (event: RunEvent) => void;
   /** 她在游戏里做的事（给舞台终端显示） */
   onAction?: (text: string) => void;
+  /** 游戏标签页的实时预览帧 */
+  onFrame?: (jpeg: Buffer) => void;
   /** 开局前的检查：有问题返回原因（开局设置不对时不开局） */
   preflight?: () => Promise<string | null>;
   /** 摄像机客户端（真的 Minecraft 客户端，旁观模式挂在她身上）；null = 不开。要有 RCON 才能把它切成旁观 */
@@ -186,6 +188,7 @@ export class MinecraftSession implements GameSession {
   private lastDimension: string | null = null;
   private lastRespectate = 0;
   private camera: CameraClient | null = null;
+  private streamFps = 0;
   /** 她画好的图纸：名字 → 图纸（这局里一直在） */
   private designs = new Map<string, Blueprint>();
   /** 选好的地方：图纸名 → 坐标和那里的虚影（草稿）。改同名图纸虚影跟着变；build 不写坐标就盖在这里 */
@@ -206,9 +209,9 @@ export class MinecraftSession implements GameSession {
   private ghosts = new Map<string, GhostBuild>();
   private ghostSeq = 0;
   private preflightFailed = false;
-  /** 开局前检查没过：这局其实没开 */
+  /** 开局前检查没过、或者没连上服务器：这局其实没开 */
   get started(): boolean {
-    return !this.preflightFailed;
+    return !this.preflightFailed && !!this.status?.connected;
   }
   private hudTimer: NodeJS.Timeout | null = null;
   private hudBusy = false;
@@ -806,6 +809,11 @@ export class MinecraftSession implements GameSession {
   /** 她这一轮结束了：世界不会停，身体照样做手上的事、照样自保 */
   pause(): void {}
 
+  setStream(fps: number): void {
+    this.streamFps = fps;
+    this.camera?.setStream(fps);
+  }
+
   async stop(): Promise<void> {
     this.finished = true;
     this.saveLast();
@@ -1036,14 +1044,15 @@ export class MinecraftSession implements GameSession {
     this.defaultViewSet = false;
     this.camera = new CameraClient({
       root, version, username: cam.name, host: this.options.host, port: this.options.port,
-      gameDir: cam.gameDir, java: findJava(cam.java, root), hudPort: cam.hudPort, log: this.options.log,
+      gameDir: cam.gameDir, java: findJava(cam.java, root), hudPort: cam.hudPort, onFrame: this.options.onFrame, log: this.options.log,
     });
     this.cameraNote = `摄像机客户端（${cam.name}，Minecraft ${version}）正在打开，进服后会自动挂到她身上。`;
     try {
       await this.camera.start();
+      this.camera.setStream(this.streamFps);
       this.hudTimer ??= setInterval(() => void this.pushHud(), HUD_MS);
       this.followTimer ??= setInterval(() => void this.followStep(), FOLLOW_MS);
-      this.cameraNote = `她的画面在摄像机客户端窗口里（${cam.name}，跟着她的视角）。直播时 OBS 抓这个窗口${cam.hudPort ? `，血量、快捷栏这些用浏览器源 http://127.0.0.1:${cam.hudPort}/ 叠在上面（和窗口一样大）` : ''}。`;
+      this.cameraNote = `游戏页会显示摄像机客户端（${cam.name}）的实时画面，也可以直接在客户端窗口里看。直播时 OBS 抓这个窗口${cam.hudPort ? `，血量、快捷栏这些用浏览器源 http://127.0.0.1:${cam.hudPort}/ 叠在上面（和窗口一样大）` : ''}。`;
     } catch (err) {
       this.camera = null;
       this.cameraNote = `摄像机客户端没开起来：${(err as Error).message}`;
