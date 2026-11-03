@@ -83,9 +83,9 @@ html, body {
 .ls-backdrop, .ls-overlay { position: absolute; inset: 0; pointer-events: none; }
 .ls-overlay { z-index: 50; }
 .ls-layer { position: absolute; inset: 0; }
-/* 换布局（聊天 ↔ 放视频）时挂件平滑挪过去 */
+/* 换布局（聊天 ↔ 放视频）时挂件平滑挪过去；普通浮层始终在全屏媒体上面 */
 .ls-slot {
-  position: absolute; transform-origin: 0 0;
+  position: absolute; z-index: 3; transform-origin: 0 0;
   transition: left .8s cubic-bezier(.22, .9, .25, 1), top .8s cubic-bezier(.22, .9, .25, 1), width .8s cubic-bezier(.22, .9, .25, 1),
     height .8s cubic-bezier(.22, .9, .25, 1), transform .8s cubic-bezier(.22, .9, .25, 1), opacity .5s ease;
 }
@@ -390,10 +390,11 @@ html, body {
 .ls-board-dots i { width: 8px; height: 8px; border-radius: 50%; background: color-mix(in srgb, var(--ls-accent) 25%, transparent); transition: background .3s, width .3s; }
 .ls-board-dots i.ls-on { width: 20px; border-radius: 4px; background: var(--ls-accent); }
 
-/* ── 弹幕：一整块面板，里面是聊天气泡 ── */
+/* ── 弹幕：半透明面板和气泡，文字保持不透明 ── */
 .ls-chat {
   height: 100%; box-sizing: border-box; display: flex; flex-direction: column;
-  background: var(--ls-panel); border: 3px solid var(--ls-panel-border); border-radius: 32px;
+  background: color-mix(in srgb, var(--ls-panel) 55%, transparent);
+  border: 3px solid color-mix(in srgb, var(--ls-panel-border) 60%, transparent); border-radius: 32px;
   backdrop-filter: blur(var(--ls-blur)) saturate(140%); box-shadow: var(--ls-shadow);
   overflow: hidden;
 }
@@ -439,10 +440,10 @@ html, body {
 .ls-chat-text {
   position: relative; max-width: 100%; box-sizing: border-box; padding: 10px 18px 11px; border-radius: 6px 22px 22px 22px;
   font-size: var(--ls-chat-size); font-weight: 600; line-height: 1.4; word-break: break-word; color: var(--ls-text);
-  background: var(--ls-bubble);
+  background: color-mix(in srgb, var(--ls-bubble) 72%, transparent);
   transition: background 0.3s, box-shadow 0.3s, color 0.3s;
 }
-.ls-row-guard .ls-chat-text { background: color-mix(in srgb, var(--ls-guard-c) 22%, var(--ls-bubble)); }
+.ls-row-guard .ls-chat-text { background: color-mix(in srgb, var(--ls-guard-c) 18%, color-mix(in srgb, var(--ls-bubble) 72%, transparent)); }
 .ls-row-guard-3 { --ls-guard-c: #4a9dff; }
 .ls-row-guard-2 { --ls-guard-c: #b07bff; }
 .ls-row-guard-1 { --ls-guard-c: #ffae2e; }
@@ -830,9 +831,9 @@ html, body {
   background: #fff; color: #34405e; font: 15px system-ui; cursor: pointer;
 }
 
-/* ── 放视频 ── */
-.ls-slot-video { z-index: 2; }
-.ls-mode-video .ls-slot-character { z-index: 3; }
+/* ── 放视频 / 玩游戏：媒体在底层，弹幕、字幕和状态等普通挂件浮在上面 ── */
+.ls-slot-video, .ls-slot-game { z-index: 2; }
+.ls-slot-full .ls-video, .ls-slot-full .ls-game { border: 0; border-radius: 0; box-shadow: none; }
 /* 玩游戏时她本人就站在游戏画面右下角，终端上那个敲电脑的小人就不要了（两个挤在一起） */
 .ls-mode-game .ls-term-art { display: none; }
 .ls-video {
@@ -849,6 +850,28 @@ html, body {
 }
 .ls-video-caption b { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 700; }
 .ls-video-caption span { flex: none; font-size: 26px; opacity: .8; }
+
+/* ── 弹幕投票：固定在右上角，压在视频、游戏和普通挂件上面 ── */
+.ls-vote {
+  position: absolute; right: 32px; top: 28px; z-index: 60; width: 500px; box-sizing: border-box;
+  padding: 24px; border: 3px solid color-mix(in srgb, var(--ls-accent) 65%, #fff);
+  border-radius: 28px; background: rgba(16, 22, 42, .92); color: #f4f7ff;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .42); backdrop-filter: blur(16px) saturate(140%);
+  pointer-events: none; animation: ls-vote-in .25s ease-out;
+}
+@keyframes ls-vote-in { from { opacity: 0; transform: translateY(-14px) scale(.97); } }
+.ls-vote-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.ls-vote-head > b { color: var(--ls-accent-2); font: 900 30px var(--ls-font-cute); letter-spacing: 2px; }
+.ls-vote-head > span { flex: none; min-width: 76px; padding: 5px 14px; border-radius: 999px; background: var(--ls-accent); color: #fff; font-size: 25px; font-weight: 800; text-align: center; }
+.ls-vote-question { margin: 13px 0 16px; font-size: 30px; font-weight: 700; line-height: 1.35; }
+.ls-vote-options { display: flex; flex-direction: column; gap: 10px; }
+.ls-vote-option { display: flex; align-items: center; gap: 13px; min-height: 54px; padding: 9px 14px; border: 2px solid rgba(255, 255, 255, .12); border-radius: 17px; background: rgba(255, 255, 255, .07); }
+.ls-vote-option > b { display: grid; place-items: center; flex: none; width: 38px; height: 38px; border-radius: 12px; background: var(--ls-accent); color: #fff; font-size: 27px; }
+.ls-vote-option > span { flex: 1; min-width: 0; font-size: 27px; line-height: 1.25; overflow-wrap: anywhere; }
+.ls-vote-option > strong { flex: none; color: var(--ls-accent-2); font-size: 24px; }
+.ls-vote-option.ls-vote-winner { border-color: var(--ls-accent-2); background: color-mix(in srgb, var(--ls-accent) 30%, transparent); }
+.ls-vote-foot { margin-top: 16px; color: rgba(235, 241, 255, .78); font-size: 23px; line-height: 1.35; }
+.ls-vote-ended .ls-vote-foot { color: var(--ls-accent-2); font-weight: 800; }
 
 /* ── 整屏特效（effects 挂件；有哪些、怎么换见 src/stage/effects.tsx）── */
 .ls-effects, .ls-fx { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }

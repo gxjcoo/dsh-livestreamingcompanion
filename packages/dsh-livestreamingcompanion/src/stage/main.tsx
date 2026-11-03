@@ -9,7 +9,7 @@ import { arrange, type Mode, type Slot } from './layout';
 import type { WidgetType } from './protocol';
 import { assetUrl, connect, preview, unlockAudio } from './store';
 import { Effects } from './effects';
-import { Alerts, Board, Character, Chat, Game, Notice, Reply, Rice, Scene, Status, Subtitle, SUBTITLE_LINGER_MS, Terminal, useLinger, useStage, Video } from './widgets';
+import { Alerts, Board, Character, Chat, Game, Notice, Reply, Rice, Scene, Status, Subtitle, SUBTITLE_LINGER_MS, Terminal, useLinger, useStage, Video, Vote } from './widgets';
 
 // ai-label 不再注册：旧模板和自定义模板里的这个挂件也直接跳过。
 const WIDGETS: Partial<Record<WidgetType, React.ComponentType<{ options?: Record<string, unknown> }>>> = {
@@ -46,12 +46,12 @@ function overlaps(a: Slot, b: Slot): boolean {
   return w > 0 && h > 0 && w * h > 0.5 * Math.min(a.w * a.h, b.w * b.h);
 }
 
-function Placed({ p, covered = false }: { p: Slot; covered?: boolean }) {
+function Placed({ p, covered = false, full = false }: { p: Slot; covered?: boolean; full?: boolean }) {
   const Widget = WIDGETS[p.type];
   if (!Widget) return null;
   return (
     <div
-      className={`ls-slot ls-slot-${p.type}${p.hidden || covered ? ' ls-hidden' : ''}`}
+      className={`ls-slot ls-slot-${p.type}${p.hidden || covered ? ' ls-hidden' : ''}${full ? ' ls-slot-full' : ''}`}
       style={{ left: p.x, top: p.y, width: p.w, height: p.h, transform: p.scale && p.scale !== 1 ? `scale(${p.scale})` : undefined }}
     >
       <Widget options={p.options} />
@@ -115,9 +115,10 @@ function App() {
       >
         {/* 背景和前景各几层空的 div：模板拿它们（和各自的 ::before / ::after）画光、气泡、云……，挂件在中间 */}
         <div className="ls-backdrop" style={hole}><i className="ls-layer ls-layer-1" /><i className="ls-layer ls-layer-2" /><i className="ls-layer ls-layer-3" /></div>
-        {slots.map((p) => <Placed key={p.key} p={p} covered={!!speaking && sharesSubtitle(p)} />)}
+        {slots.map((p) => <Placed key={p.key} p={p} covered={!!speaking && sharesSubtitle(p)} full={p.x === 0 && p.y === 0 && p.w === cw && p.h === ch} />)}
         <div className="ls-overlay" style={hole}><i className="ls-layer ls-layer-1" /><i className="ls-layer ls-layer-2" /></div>
         <Notice />
+        <Vote />
       </div>
       {needsClick && !preview && (
         <button className="ls-unlock" onClick={unlockAudio}>点一下这里开启声音（OBS 的浏览器源不需要）</button>

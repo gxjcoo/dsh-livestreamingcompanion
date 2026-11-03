@@ -3,7 +3,7 @@
  * 唯一往回发的是「这句念完了」（出声的页面才发；预览页静音、不回执）。
  */
 
-import type { BrainState, CharacterManifest, GameSource, GameStatus, StageEvent, StageLiveEvent, StageUser, TemplateManifest } from './protocol';
+import type { BrainState, CharacterManifest, GameSource, GameStatus, StageEvent, StageLiveEvent, StageUser, TemplateManifest, VoteSnapshot } from './protocol';
 import { type FxEvent, giftTier, pick, triggersOf } from './triggers';
 
 export interface ChatRow {
@@ -144,6 +144,8 @@ export interface StageState {
   game: GameSource | null;
   /** 游戏画面上那一行「她在干嘛」 */
   gameStatus: GameStatus | null;
+  /** 右上角的弹幕投票；null 不显示 */
+  vote: VoteSnapshot | null;
 }
 
 const MAX_CHATS = 30;
@@ -205,7 +207,7 @@ function startUpdating(): void {
 let state: StageState = {
   connected: false, character: null, template: null, brain: 'off', brainDetail: '', line: null, lineEndedAt: 0,
   chats: [], alerts: [], focus: new Set(), reply: [], replySeq: 0, onAir: false, needsClick: false,
-  phase: wasUpdating() ? 'updating' : 'waiting', stats: freshStats(), tokens: 0, model: '', term: [], media: null, board: '', notice: '', game: null, gameStatus: null, fx: [], reaction: null,
+  phase: wasUpdating() ? 'updating' : 'waiting', stats: freshStats(), tokens: 0, model: '', term: [], media: null, board: '', notice: '', game: null, gameStatus: null, vote: null, fx: [], reaction: null,
 };
 const subscribers = new Set<() => void>();
 
@@ -533,6 +535,7 @@ function handle(event: StageEvent): void {
     case 'notice': return update((s) => ({ ...s, notice: event.text }));
     case 'game': return update((s) => ({ ...s, game: event.source, ...(event.source ? {} : { gameStatus: null }) }));
     case 'gameStatus': return update((s) => ({ ...s, gameStatus: event.status }));
+    case 'vote': return update((s) => ({ ...s, vote: event.vote }));
     case 'note': return update((s) => term(s, event.tag, event.text));
   }
 }

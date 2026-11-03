@@ -134,6 +134,19 @@ export interface GameStatus {
   time?: string;
 }
 
+/** 右上角弹幕投票；winner / tied 里都是从 1 开始的选项编号 */
+export interface VoteSnapshot {
+  id: string;
+  question: string;
+  options: string[];
+  counts: number[];
+  startedAt: number;
+  endsAt: number;
+  status: 'active' | 'ended';
+  winner: number | null;
+  tied: number[];
+}
+
 export interface WidgetPlacement {
   type: WidgetType;
   /** 画布坐标（像素） */
@@ -199,5 +212,7 @@ export type StageEvent =
   | { v: 1; type: 'game'; source: GameSource | null; at: number }
   /** 游戏画面上那一行「她在干嘛」（身体在做的事、血量、白天黑夜）；null：没在玩 */
   | { v: 1; type: 'gameStatus'; status: GameStatus | null; at: number }
+  /** 弹幕投票：右上角弹窗；null 收起 */
+  | { v: 1; type: 'vote'; vote: VoteSnapshot | null; at: number }
   /** 模板或角色换了：舞台重新加载 */
   | { v: 1; type: 'reload'; at: number };

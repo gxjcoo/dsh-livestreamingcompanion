@@ -28,6 +28,7 @@ import { gameStatusOf } from './gameStatus';
 import { Player, type PlayRequest } from './player';
 import type { VideoNotes } from './watchAlong';
 import { Stage } from './stage';
+import { LiveVote, voteResultText } from './vote';
 
 /** 一个视频不放了：怎么结束的、放了多少秒、这期间她说了什么 */
 export interface VideoEnd {
@@ -159,6 +160,8 @@ function whenNow(d: Date): string {
 export class LiveShow {
   readonly hub = new LiveHub();
   readonly stage = new Stage();
+  /** 冲突要求的弹幕投票：编号选票在这里计，结果由 start_vote 工具交回主播 */
+  readonly votes = new LiveVote(this.stage);
   /** 舞台上放视频（她用 play_video）：放完了告诉她 */
   readonly player = new Player(this.stage, (video, how, playedSec) => {
     this.record({ type: 'video', bvid: video.bvid, title: video.title, how, playedSec: Math.round(playedSec) });
@@ -318,9 +321,13 @@ export class LiveShow {
 
   private observe(event: LiveEvent, isUpdate: boolean): void {
     const now = Date.now();
-    this.attention.observe(event, isUpdate, now);
-    // 只记自己直播间的观众（主人在控制台勾了的）；模拟观众（控制台彩排）不记
-    if (this.onAir && this.memoryStream && !event.user.id.startsWith(SIMULATED_PREFIX)) this.memory.observe(event, isUpdate, now);
+    // 有效编号选票只计票，不再作为「1」「2」之类的普通请求推给主播，也不写进观众记忆；弹幕区仍照常显示
+    const ballot = this.votes.observe(event, isUpdate);
+    if (!ballot) {
+      this.attention.observe(event, isUpdate, now);
+      // 只记自己直播间的观众（主人在控制台勾了的）；模拟观众（控制台彩排）不记
+      if (this.onAir && this.memoryStream && !event.user.id.startsWith(SIMULATED_PREFIX)) this.memory.observe(event, isUpdate, now);
+    }
     const shown = toStage(event);
     if (shown) this.stage.broadcast({ type: 'live', event: shown, isUpdate });
     if (this.onAir && !isUpdate && (event.kind === 'superchat' || event.kind === 'membership' || (event.kind === 'gift' && event.valueYuan > 0))) {
@@ -432,6 +439,7 @@ export class LiveShow {
   endLive(): void {
     if (!this.onAir || this.ending) return;
     this.ending = true;
+    this.votes.cancel();
     this.priority.unshift({ kind: 'ending', summary: '' });
     this.endingTimer = setTimeout(() => this.finish(), ENDING_GRACE_MS);
   }
@@ -822,6 +830,16 @@ export class LiveShow {
 
   // ── 她的工具用到的 ──────────────────────────────────
 
+  /** 发起冲突要求的投票并等 10 秒；结果文字直接成为 start_vote 的工具结果 */
+  async startVote(question: string, options: string[]): Promise<string> {
+    if (!this.onAir || this.ending) return '现在没开播或正在下播，不能发起投票。';
+    try {
+      return voteResultText(await this.votes.start(question, options));
+    } catch (err) {
+      return `投票没能开始：${(err as Error).message}`;
+    }
+  }
+
   /** 按她看到的名字（或 UID）在这场直播最近的事件里找观众；找不到、对不上好几位时带着候选（见 core/viewerLookup） */
   lookupViewer(who: string): ViewerLookup {
     return lookupViewer(who, this.hub.recentEvents(), { simulatedPrefix: SIMULATED_PREFIX });
@@ -1000,6 +1018,7 @@ export class LiveShow {
 
   /** 插件停了（多半是 DSH 重启、更新）：在播的这一场不收尾，存好，起来以后接着播 */
   dispose(): void {
+    this.votes.cancel();
     if (this.onAir && !this.ending) {
       this.persistLive();
       this.record({ type: 'suspend' });

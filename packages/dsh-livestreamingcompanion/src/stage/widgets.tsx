@@ -1010,6 +1010,39 @@ function Ending() {
   );
 }
 
+/** 冲突要求的右上角投票弹窗：计票和 10 秒截止由身体负责，这里只显示状态和本地倒计时 */
+export function Vote() {
+  const { vote } = useStage();
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (vote?.status !== 'active') return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(timer);
+  }, [vote?.id, vote?.status, vote?.endsAt]);
+  if (!vote) return null;
+  const seconds = Math.max(0, Math.ceil((vote.endsAt - now) / 1000));
+  const result = vote.winner
+    ? `${vote.winner} 号「${vote.options[vote.winner - 1]}」胜出！`
+    : vote.tied.length ? '平票，本轮不执行' : '没有收到有效投票';
+  return (
+    <section className={`ls-vote${vote.status === 'ended' ? ' ls-vote-ended' : ''}`} role="status" aria-label="弹幕投票">
+      <div className="ls-vote-head"><b>弹幕投票</b><span>{vote.status === 'active' ? `${seconds}s` : '投票结果'}</span></div>
+      <div className="ls-vote-question">{vote.question}</div>
+      <div className="ls-vote-options">
+        {vote.options.map((option, i) => (
+          <div className={`ls-vote-option${vote.winner === i + 1 ? ' ls-vote-winner' : ''}`} key={`${vote.id}-${i}`}>
+            <b>{i + 1}</b><span>{option}</span><strong>{vote.counts[i] ?? 0} 票</strong>
+          </div>
+        ))}
+      </div>
+      <div className="ls-vote-foot">
+        {vote.status === 'active' ? '发弹幕编号投票 · 每人一票，可改票' : result}
+      </div>
+    </section>
+  );
+}
+
 /** 画面最底下的滚动通知：主人在控制台写，出状况时告诉观众（卡了、在修、马上回来） */
 export function Notice() {
   const { notice } = useStage();

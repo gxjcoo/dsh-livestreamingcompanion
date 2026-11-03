@@ -643,6 +643,26 @@ ${profileText(profile)}` : '没打开自己的主页（B 站没返回，可能�
     },
   })), 'set_live_title tool');
 
+  // 冲突要求交给观众决定：工具等待 10 秒计票，唯一胜选项随结果交回这一轮执行
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 'start_vote',
+    description: '一位或多位观众同时提出互相冲突、不能一起做的要求时，发起 10 秒弹幕投票。'
+      + '右上角显示编号选项，观众发 1、2、3……投票，每人一票、可以改票。'
+      + '工具会等计票结束并返回结果：有唯一胜选项时必须接着只执行它；平票或无人投票时不要执行。'
+      + '不要用于普通聊天、互不冲突的要求或主人的明确指令。',
+    parameters: {
+      question: { type: 'string', required: true, description: '请大家决定什么，60 字以内，比如「接下来做什么？」' },
+      options: { type: 'array', required: true, items: { type: 'string' }, description: '2–6 个互相冲突的具体做法，每个 40 字以内，不要只写人名' },
+    },
+    output: stringOut,
+    async execute(args) {
+      const question = String(args.question ?? '').trim();
+      const options = Array.isArray(args.options) ? args.options.map((option) => String(option)) : [];
+      show.toolCall('start_vote', question.slice(0, 30), '在等弹幕投票（10 秒）');
+      return show.startVote(question, options);
+    },
+  })), 'start_vote tool');
+
   // 视频点播只开放抖音工具：不要在这里注册 B 站搜索 / 观看 / 播放工具，
   // 否则模型即使收到「只用抖音」的提示，仍可能自行选择 B 站。
 
