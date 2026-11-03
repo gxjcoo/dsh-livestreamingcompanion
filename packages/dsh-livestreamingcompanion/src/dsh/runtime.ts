@@ -121,7 +121,7 @@ function ownerPace(p: Pace | undefined): OwnerPace {
 export const DEFAULT_BOARD = [
   '想看什么，跟大肥鱼说',
   '说个大概：「想看猫猫」',
-  '她自己去 B 站搜、挑来放',
+  '她自己去抖音搜、挑来放',
   '找错了告诉她，她再找',
   '',
   '还可以这样玩',
@@ -134,6 +134,9 @@ export const DEFAULT_BOARD = [
   '下指令给游戏里的身体去做',
   '边玩边回弹幕，没人替她玩',
 ].join('\n');
+
+/** 旧版默认告示板：只在用户没自定义过时跟着改成抖音，别覆盖主人自己写的文案 */
+const LEGACY_DEFAULT_BOARD = DEFAULT_BOARD.replace('她自己去抖音搜、挑来放', '她自己去 B 站搜、挑来放');
 
 /** 机密的名字（DSH 凭据）。豆包的和 dsh-game 共用 */
 export const SECRETS = {
@@ -216,10 +219,16 @@ function loadSettings(): Settings {
     pace: {},
     ...saved,
   };
+  let dirty = false;
+  if (saved.boardText === LEGACY_DEFAULT_BOARD) {
+    settings.boardText = DEFAULT_BOARD;
+    dirty = true;
+  }
   if (!settings.stageToken) {
     settings.stageToken = randomBytes(12).toString('base64url');
-    saveSettings(settings);
+    dirty = true;
   }
+  if (dirty) saveSettings(settings);
   return settings;
 }
 

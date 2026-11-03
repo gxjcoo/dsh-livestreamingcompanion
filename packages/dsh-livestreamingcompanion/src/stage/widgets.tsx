@@ -846,10 +846,6 @@ export function Status({ options }: { options?: Record<string, unknown> }) {
   );
 }
 
-export function AiLabel({ options }: { options?: Record<string, unknown> }) {
-  return <div className="ls-ai-label"><i />{String(options?.text ?? 'AI 主播 · 内容由人工智能生成')}</div>;
-}
-
 // ── 吃饭计数 ─────────────────────────────────────────
 
 

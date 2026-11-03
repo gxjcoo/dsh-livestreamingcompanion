@@ -9,15 +9,15 @@ import { arrange, type Mode, type Slot } from './layout';
 import type { WidgetType } from './protocol';
 import { assetUrl, connect, preview, unlockAudio } from './store';
 import { Effects } from './effects';
-import { AiLabel, Alerts, Board, Character, Chat, Game, Notice, Reply, Rice, Scene, Status, Subtitle, SUBTITLE_LINGER_MS, Terminal, useLinger, useStage, Video } from './widgets';
+import { Alerts, Board, Character, Chat, Game, Notice, Reply, Rice, Scene, Status, Subtitle, SUBTITLE_LINGER_MS, Terminal, useLinger, useStage, Video } from './widgets';
 
-const WIDGETS: Record<WidgetType, React.ComponentType<{ options?: Record<string, unknown> }>> = {
+// ai-label 不再注册：旧模板和自定义模板里的这个挂件也直接跳过。
+const WIDGETS: Partial<Record<WidgetType, React.ComponentType<{ options?: Record<string, unknown> }>>> = {
   character: Character,
   subtitle: Subtitle,
   chat: Chat,
   alerts: Alerts,
   status: Status,
-  'ai-label': AiLabel,
   reply: Reply,
   rice: Rice,
   terminal: Terminal,
