@@ -109,10 +109,16 @@ export async function synthesize(auth: TtsAuth, voice: string, text: string, sig
   const words: TimedWord[] = [];
   for (const line of (await res.text()).split('\n')) {
     if (!line.trim()) continue;
-    const msg = JSON.parse(line) as {
+    let msg: {
       code?: number; message?: string; data?: string;
       sentence?: { words?: Array<{ word?: string; startTime?: number; endTime?: number }> };
     };
+    // 上游偶尔夹一行非 JSON（风控页、SSE 前缀、被截断的行）：跳过它，别让整句合成失败
+    try {
+      msg = JSON.parse(line) as typeof msg;
+    } catch {
+      continue;
+    }
     if (msg.data) chunks.push(Buffer.from(msg.data, 'base64'));
     // 第一条 sentence 是整段文字（words 为空），后面每句一条带逐字时间
     else if (msg.sentence?.words?.length) {
@@ -183,7 +189,7 @@ async function localSynthesize(local: LocalTts, text: string, signal: AbortSigna
   const wav = Buffer.from(await res.arrayBuffer());
   if (wav.length < 100) throw new Error('本地语音没返回音频');
   // wav 一句 500+ KB，走 SSE 传舞台太沉；转 96 kbps mp3（和豆包一个量级）。转不了就用原 wav，舞台按魔数自己选 mime
-  const mp3 = await toMp3(wav);
+  const mp3 = await toMp3(wav, signal);
   return { audio: new Uint8Array(mp3 ?? wav), words: [] };
 }
 
@@ -200,7 +206,9 @@ function ffmpegPath(): string | null {
 }
 
 /** wav → mp3（96 kbps）；任何一步失败返回 null，让调用方用原 wav */
-async function toMp3(wav: Buffer): Promise<Buffer | null> {
+const TO_MP3_TIMEOUT_MS = 10_000;
+
+export async function toMp3(wav: Buffer, signal?: AbortSignal): Promise<Buffer | null> {
   const exe = ffmpegPath();
   if (!exe) return null;
   return new Promise((resolve) => {
@@ -209,9 +217,47 @@ async function toMp3(wav: Buffer): Promise<Buffer | null> {
       stdio: ['pipe', 'pipe', 'ignore'],
     });
     const chunks: Buffer[] = [];
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    // kill 一个没起来或已经退出的进程会抛 EINVAL；这里只是收尾，不该反过来把调用方炸掉
+    const killChild = (): void => {
+      try {
+        child.kill();
+      } catch {
+        /* 进程已经没了 */
+      }
+    };
+    // 只收尾一次：error / close / abort / 超时可能先后都到
+    const finish = (value: Buffer | null): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve(value);
+    };
+    const onAbort = (): void => {
+      killChild();
+      finish(null);
+    };
+    // 先把所有监听挂好，再碰 signal / timer —— 否则 abort 里的同步异常会让后面的监听全丢掉
     child.stdout!.on('data', (c: Buffer) => chunks.push(c));
-    child.on('error', () => resolve(null));
-    child.on('close', (code) => resolve(code === 0 && chunks.length ? Buffer.concat(chunks) : null));
+    child.stdout!.on('error', () => finish(null));
+    child.on('error', () => finish(null));
+    child.on('close', (code) => finish(code === 0 && chunks.length ? Buffer.concat(chunks) : null));
+    // ffmpeg 提前退出时写 stdin 会 EPIPE；Writable 没有 error 监听就是未捕获异常，会崩掉整个宿主进程
+    child.stdin!.on('error', () => finish(null));
+    // ffmpeg 卡死时 close 永不触发，这里兜一个上限，免得本地合成跟着永久挂起
+    timer = setTimeout(() => {
+      killChild();
+      finish(null);
+    }, TO_MP3_TIMEOUT_MS);
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+    }
     child.stdin!.end(wav);
   });
 }

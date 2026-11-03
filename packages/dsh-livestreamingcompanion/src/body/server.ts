@@ -84,6 +84,8 @@ export class StageServer {
       server.once('error', reject);
       server.listen(this.options.port, '127.0.0.1', () => {
         server.off('error', reject);
+        // listen 之后原来的 reject 监听被摘掉了：不补一个持久的，运行期 socket 错误会变成未捕获异常
+        server.on('error', (err: Error) => this.options.log?.('warn', `舞台服务器出错：${err.message}`));
         this.server = server;
         resolve();
       });
