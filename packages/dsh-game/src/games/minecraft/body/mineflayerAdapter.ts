@@ -48,6 +48,25 @@ import { runAbortableOperation } from './abortableOperation.js';
 import { patchedGoto, type PathfindResult } from './patchedGoto.js';
 import { measurePlayerGaze, PlayerGazeTracker } from './playerGaze.js';
 import { hasFollowRecoveryMovement } from './followRecovery.js';
+import {
+  abortError,
+  armorPoints,
+  clearPathfinderGoal,
+  compareVersionParts,
+  delay,
+  distanceBetween,
+  distanceToBot,
+  extractMissingVersion,
+  fallbackSupportedVersion,
+  formatPosition,
+  formatPositionDelta,
+  formatPrecisePosition,
+  isVersionDataMissingError,
+  numericVersionParts,
+  relativeDirection,
+  throwIfAborted,
+  vector,
+} from './util.js';
 
 const HOSTILE_MOBS = new Set([
   'blaze',
@@ -3424,42 +3443,6 @@ function equipDestinationFor(itemName: string): 'hand' | 'off-hand' | 'head' | '
   return 'hand';
 }
 
-function isVersionDataMissingError(error: unknown): boolean {
-  return error instanceof Error && /No data available for version/.test(error.message);
-}
-
-function extractMissingVersion(error: unknown): string | undefined {
-  if (!(error instanceof Error)) return undefined;
-  const match = /No data available for version (\S+)/.exec(error.message);
-  return match?.[1];
-}
-
-function fallbackSupportedVersion(target: string): string | undefined {
-  const targetParts = numericVersionParts(target);
-  const latestParts = numericVersionParts(latestSupportedVersion ?? '');
-  if (!targetParts || !latestParts) return undefined;
-  // 只有同主版本（如 1.21.9 → 1.21.8）的次版本升级才值得回退；
-  // 跨大版本（如 26.x → 1.21.x）协议必然不兼容，不要猜测。
-  if (compareVersionParts(targetParts, latestParts) <= 0) return undefined;
-  if (targetParts[0] !== latestParts[0]) return undefined;
-  return latestSupportedVersion;
-}
-
-function numericVersionParts(version: string): number[] | undefined {
-  if (!/^\d+(\.\d+)*$/.test(version)) return undefined;
-  const parts = version.split('.').map((part) => Number.parseInt(part, 10));
-  return parts.every((part) => Number.isFinite(part)) ? parts : undefined;
-}
-
-function compareVersionParts(left: number[], right: number[]): number {
-  const length = Math.max(left.length, right.length);
-  for (let index = 0; index < length; index += 1) {
-    const diff = (left[index] ?? 0) - (right[index] ?? 0);
-    if (diff !== 0) return diff;
-  }
-  return 0;
-}
-
 function deriveDropItemForBlock(bot: any, blockName: string): string | undefined {
   const block = bot.registry?.blocksByName?.[blockName];
   if (!block) return undefined;
@@ -3782,30 +3765,6 @@ function normalizeEntityName(value: unknown): string | undefined {
   return value.trim().toLowerCase().replace(/[\s-]+/g, '_');
 }
 
-function vector(position: any): { x: number; y: number; z: number } {
-  return {
-    x: Number(position?.x ?? 0),
-    y: Number(position?.y ?? 0),
-    z: Number(position?.z ?? 0),
-  };
-}
-
-function formatPosition(position: any): string {
-  const value = vector(position);
-  return `${value.x.toFixed(0)},${value.y.toFixed(0)},${value.z.toFixed(0)}`;
-}
-
-function formatPrecisePosition(position: any): string {
-  const value = vector(position);
-  return `${value.x.toFixed(2)},${value.y.toFixed(2)},${value.z.toFixed(2)}`;
-}
-
-function formatPositionDelta(from: any, to: any): string {
-  const start = vector(from);
-  const end = vector(to);
-  return `${(end.x - start.x).toFixed(2)},${(end.y - start.y).toFixed(2)},${(end.z - start.z).toFixed(2)}`;
-}
-
 async function confirmEntityDeath(
   bot: any,
   entity: any,
@@ -3960,65 +3919,6 @@ function sameEntity(left: any, right: any): boolean {
 
 function entityKey(entity: any): string {
   return entity?.id !== undefined ? `id:${entity.id}` : `pos:${formatPosition(entity?.position)}`;
-}
-
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const finish = () => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    };
-    const timer = setTimeout(finish, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      reject(abortError());
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-    if (signal?.aborted) onAbort();
-  });
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) throw abortError();
-}
-
-function distanceToBot(bot: any, position: any): number {
-  const own = bot.entity?.position;
-  if (!own || !position) return Number.POSITIVE_INFINITY;
-  if (typeof own.distanceTo === 'function') return own.distanceTo(position);
-  const x = Number(own.x ?? 0) - Number(position.x ?? 0);
-  const y = Number(own.y ?? 0) - Number(position.y ?? 0);
-  const z = Number(own.z ?? 0) - Number(position.z ?? 0);
-  return Math.sqrt(x * x + y * y + z * z);
-}
-
-function distanceBetween(
-  left: { x: number; y: number; z: number },
-  right: { x: number; y: number; z: number },
-): number {
-  const x = left.x - right.x;
-  const y = left.y - right.y;
-  const z = left.z - right.z;
-  return Math.sqrt(x * x + y * y + z * z);
-}
-
-function clearPathfinderGoal(bot: any): void {
-  if (typeof bot?.pathfinder?.setGoal === 'function') {
-    bot.pathfinder.setGoal(null);
-    return;
-  }
-  bot?.pathfinder?.stop?.();
-}
-
-function relativeDirection(bot: any, position: any): string {
-  const own = bot.entity?.position;
-  if (!own || !position) return 'unknown';
-  const dx = Number(position.x ?? 0) - Number(own.x ?? 0);
-  const dz = Number(position.z ?? 0) - Number(own.z ?? 0);
-  const eastWest = Math.abs(dx) < 1 ? '' : dx > 0 ? 'east' : 'west';
-  const northSouth = Math.abs(dz) < 1 ? '' : dz > 0 ? 'south' : 'north';
-  return [northSouth, eastWest].filter(Boolean).join('-') || 'nearby';
 }
 
 async function collectSugarCane(
@@ -4301,27 +4201,3 @@ function classifyEntity(entity: any): MinecraftEntitySnapshot {
   return { kind: HOSTILE_MOBS.has(name) ? 'hostile' : 'neutral', name };
 }
 
-function abortError(): Error {
-  const error = new Error('Minecraft collection cancelled');
-  error.name = 'AbortError';
-  return error;
-}
-
-/** 原版盔甲值：头盔、胸甲、护腿、靴子各加几点 */
-const ARMOR_POINTS: Record<string, [number, number, number, number]> = {
-  leather: [1, 3, 2, 1],
-  chainmail: [2, 5, 4, 1],
-  iron: [2, 6, 5, 2],
-  golden: [2, 5, 3, 1],
-  diamond: [3, 8, 6, 3],
-  netherite: [3, 8, 6, 3],
-};
-const ARMOR_PIECES = ['helmet', 'chestplate', 'leggings', 'boots'];
-
-function armorPoints(name: string | undefined): number {
-  if (!name) return 0;
-  if (name === 'turtle_helmet') return 2;
-  const [material, piece] = name.split('_');
-  const index = ARMOR_PIECES.indexOf(piece);
-  return index >= 0 ? (ARMOR_POINTS[material]?.[index] ?? 0) : 0;
-}
