@@ -179,8 +179,8 @@ export type StageLiveEvent =
 export type BrainState = 'off' | 'listening' | 'thinking' | 'speaking' | 'away';
 
 export type StageEvent =
-  /** build：舞台页代码的版本（插件更新后变）；连上时先发 */
-  | { v: 1; type: 'hello'; character: CharacterManifest; template: TemplateManifest; build?: string; at: number }
+  /** build：舞台页代码的版本（插件更新后变）；showTerminal 缺省为 true，兼容旧版身体 */
+  | { v: 1; type: 'hello'; character: CharacterManifest; template: TemplateManifest; showTerminal?: boolean; build?: string; at: number }
   /**
    * 她说一句话。timeline：逐字时间（音频里的毫秒 → 亮到第几个字），字幕按实际播放位置走；
    * 没有时（没语音、旧版身体）按 estimateMs 匀速走
@@ -191,6 +191,8 @@ export type StageEvent =
   | { v: 1; type: 'tool'; name: string; detail: string; doing?: string; at: number }
   /** 终端里记一行身体自己在做的事（不是她调用的工具，比如后台听写视频）；不改她的状态 */
   | { v: 1; type: 'note'; tag: string; text: string; at: number }
+  /** 设置里的终端聊天框开关：只隐藏面板，不停止终端事件记录 */
+  | { v: 1; type: 'terminal'; visible: boolean; at: number }
   /** 告示板：主人想让观众知道的（空行分页，每页第一行是标题）；空串不显示 */
   | { v: 1; type: 'board'; text: string; at: number }
   /** 滚动通知（主人在控制台写的，出状况时告诉观众）；空串收起 */

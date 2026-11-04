@@ -46,12 +46,12 @@ function overlaps(a: Slot, b: Slot): boolean {
   return w > 0 && h > 0 && w * h > 0.5 * Math.min(a.w * a.h, b.w * b.h);
 }
 
-function Placed({ p, covered = false, full = false }: { p: Slot; covered?: boolean; full?: boolean }) {
+function Placed({ p, covered = false, full = false, hidden = false }: { p: Slot; covered?: boolean; full?: boolean; hidden?: boolean }) {
   const Widget = WIDGETS[p.type];
   if (!Widget) return null;
   return (
     <div
-      className={`ls-slot ls-slot-${p.type}${p.hidden || covered ? ' ls-hidden' : ''}${full ? ' ls-slot-full' : ''}`}
+      className={`ls-slot ls-slot-${p.type}${p.hidden || covered || hidden ? ' ls-hidden' : ''}${full ? ' ls-slot-full' : ''}`}
       style={{ left: p.x, top: p.y, width: p.w, height: p.h, transform: p.scale && p.scale !== 1 ? `scale(${p.scale})` : undefined }}
     >
       <Widget options={p.options} />
@@ -66,7 +66,7 @@ function holePath(s: Slot, cw: number, ch: number): string {
 }
 
 function App() {
-  const { template, needsClick, media, game, line } = useStage();
+  const { template, needsClick, media, game, line, terminalVisible } = useStage();
   // 浏览器要求「先有一次用户操作」才允许出声：页面任何地方点一下或按个键就解锁，不必非得点那个按钮
   useEffect(() => {
     const unlock = () => unlockAudio();
@@ -115,7 +115,7 @@ function App() {
       >
         {/* 背景和前景各几层空的 div：模板拿它们（和各自的 ::before / ::after）画光、气泡、云……，挂件在中间 */}
         <div className="ls-backdrop" style={hole}><i className="ls-layer ls-layer-1" /><i className="ls-layer ls-layer-2" /><i className="ls-layer ls-layer-3" /></div>
-        {slots.map((p) => <Placed key={p.key} p={p} covered={!!speaking && sharesSubtitle(p)} full={p.x === 0 && p.y === 0 && p.w === cw && p.h === ch} />)}
+        {slots.map((p) => <Placed key={p.key} p={p} hidden={p.type === 'terminal' && !terminalVisible} covered={!!speaking && sharesSubtitle(p)} full={p.x === 0 && p.y === 0 && p.w === cw && p.h === ch} />)}
         <div className="ls-overlay" style={hole}><i className="ls-layer ls-layer-1" /><i className="ls-layer ls-layer-2" /></div>
         <Notice />
         <Vote />

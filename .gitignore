@@ -9,3 +9,4 @@ tools/.gen/
 .env
 .env.*
 !.env.example
+.review

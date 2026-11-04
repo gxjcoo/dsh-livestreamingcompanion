@@ -49,6 +49,8 @@ export interface Settings {
   douyinAlsoListen: boolean;
   character: string;
   template: string;
+  /** 舞台是否显示终端聊天框（她说、工具调用等） */
+  showTerminal: boolean;
   /** 空串用角色包的默认音色 */
   voice: string;
   stagePort: number;
@@ -192,6 +194,7 @@ function loadSettings(): Settings {
     douyinAlsoListen: false,
     character: 'dafeiyu',
     template: 'default',
+    showTerminal: true,
     voice: '',
     stagePort: 7390,
     stageToken: '',
@@ -376,7 +379,7 @@ export const server = new StageServer({
   packageDir: packageDir(),
   packs,
   stage: show.stage,
-  current: () => ({ character: settings.character, template: settings.template }),
+  current: () => ({ character: settings.character, template: settings.template, showTerminal: settings.showTerminal }),
   media: {
     source: (id) => show.player.source(id),
     report: (id, state, positionSec, detail) => show.player.report(id, state, positionSec, detail),

@@ -46,8 +46,8 @@ export interface StageServerOptions {
   stage: Stage;
   /** 浏览器采集页（/capture）送来的 WebM 分片：写进多平台推流的 ffmpeg */
   feed?: (chunk: Uint8Array) => boolean;
-  /** 现在用哪个角色、哪个模板 */
-  current(): { character: string; template: string };
+  /** 现在用哪个角色、哪个模板，以及是否显示终端聊天框 */
+  current(): { character: string; template: string; showTerminal: boolean };
   /** 舞台上放的视频：id → CDN 地址；舞台的回执 */
   media?: {
     source(id: string): string | null;
@@ -165,13 +165,13 @@ export class StageServer {
       connection: 'keep-alive',
     });
     const send = (event: StageEvent) => res.write(`data: ${JSON.stringify(event)}\n\n`);
-    const { character, template } = this.options.current();
+    const { character, template, showTerminal } = this.options.current();
     const c = this.options.packs.character(character);
     // ?template=<id>：给控制台的「换主题预览」和缩略图截图用，只影响这一条事件流，不碰真实设置
     const forced = url.searchParams.get('template');
     const forcedTemplate = forced && /^[\w-]{1,64}$/.test(forced) ? this.options.packs.template(forced) : null;
     const t = forcedTemplate ?? this.options.packs.template(template);
-    if (c && t) send({ v: 1, type: 'hello', character: c, template: t, build: this.build, at: Date.now() });
+    if (c && t) send({ v: 1, type: 'hello', character: c, template: t, showTerminal, build: this.build, at: Date.now() });
     // ?preview=1：控制台里的预览，静音、不回执
     const unsubscribe = this.options.stage.subscribe(send, url.searchParams.get('preview') !== '1');
     const ping = setInterval(() => res.write(': ping\n\n'), 15_000);

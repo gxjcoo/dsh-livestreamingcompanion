@@ -105,7 +105,7 @@ interface HostState {
     douyinRoom?: number | null;
     douyinBrowser?: string;
     douyinAlsoListen?: boolean;
-    character: string; template: string; voice: string; stagePort: number; idleAfterSec: number; gameChatGapSec?: number;
+    character: string; template: string; showTerminal?: boolean; voice: string; stagePort: number; idleAfterSec: number; gameChatGapSec?: number;
     distillModel: string; ownRooms: number[]; ownDouyinRooms?: number[]; broadcast: boolean; areaId: number | null; liveTitle: string;
     pushProtocol: 'srt' | 'rtmp'; streamKbps: number; manualPushAddr?: string; manualPushCode?: string; asrPython: string; asrModel: string;
     ttsBackend?: 'doubao' | 'gptsovits'; gptsovitsUrl?: string; gptsovitsRef?: string; gptsovitsPrompt?: string;
@@ -756,6 +756,14 @@ export function Console() {
                 <button className={copied ? 'dl-done' : ''} onClick={copyUrl}>{copied ? '已复制' : '复制'}</button>
               </div>
               <p className="dl-hint">想做自己的主题：把插件里 assets/templates/default 复制到 DSH 主目录的 dsh-livestream/templates/&lt;新名字&gt;/，改 template.json 的 id 和 name。</p>
+              <label className="dl-check">
+                <input
+                  type="checkbox"
+                  checked={settings?.showTerminal ?? true}
+                  onChange={(e) => choose({ showTerminal: e.target.checked })}
+                /> 显示终端聊天框
+              </label>
+              <p className="dl-hint">关闭后隐藏直播画面里的「dafeiyu@live」面板；字幕、弹幕和游戏画面不受影响。切换后立即生效。</p>
             </div>
           </aside>
         </div>

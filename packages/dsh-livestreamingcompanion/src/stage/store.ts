@@ -129,6 +129,8 @@ export interface StageState {
   tokens: number;
   model: string;
   term: TermLine[];
+  /** 设置里是否显示整个终端聊天框；事件仍继续记录，重新打开能看到最近内容 */
+  terminalVisible: boolean;
   fx: Fx[];
   /** 她对刚才那件事的反应（角色包 reactions 配的表情）；key 每次不同 */
   reaction: { key: string; mood: string } | null;
@@ -207,7 +209,7 @@ function startUpdating(): void {
 let state: StageState = {
   connected: false, character: null, template: null, brain: 'off', brainDetail: '', line: null, lineEndedAt: 0,
   chats: [], alerts: [], focus: new Set(), reply: [], replySeq: 0, onAir: false, needsClick: false,
-  phase: wasUpdating() ? 'updating' : 'waiting', stats: freshStats(), tokens: 0, model: '', term: [], media: null, board: '', notice: '', game: null, gameStatus: null, vote: null, fx: [], reaction: null,
+  phase: wasUpdating() ? 'updating' : 'waiting', stats: freshStats(), tokens: 0, model: '', term: [], terminalVisible: true, media: null, board: '', notice: '', game: null, gameStatus: null, vote: null, fx: [], reaction: null,
 };
 const subscribers = new Set<() => void>();
 
@@ -494,7 +496,7 @@ function onBrain(event: Extract<StageEvent, { type: 'brain' }>): void {
   if (event.state !== 'off' && !state.onAir && !roomSeen) onAirChanged(true);
 }
 
-function handle(event: StageEvent): void {
+export function handle(event: StageEvent): void {
   switch (event.type) {
     case 'hello':
       // 插件更新过（DSH 重启后重连上来，版本变了）：重新加载页面拿新代码。OBS 的浏览器源不会自己刷新
@@ -507,7 +509,7 @@ function handle(event: StageEvent): void {
       }
       pageBuild ??= event.build;
       helloAt = Date.now();
-      update((s) => ({ ...s, connected: true, character: event.character, template: event.template }));
+      update((s) => ({ ...s, connected: true, character: event.character, template: event.template, terminalVisible: event.showTerminal ?? true }));
       if (demo && !demoStarted) startDemo(event.character.name);
       return;
     case 'say':
@@ -515,6 +517,7 @@ function handle(event: StageEvent): void {
       return onSay(event);
     case 'brain': return onBrain(event);
     case 'tool': return update((s) => term({ ...s, brain: 'thinking', brainDetail: event.doing ?? s.brainDetail }, 'tool', `${event.name}${event.detail ? ` ${event.detail}` : ''}`));
+    case 'terminal': return update((s) => ({ ...s, terminalVisible: event.visible }));
     case 'live': return onLive(event.event, event.isUpdate);
     case 'focus': return update((s) => ({ ...s, focus: new Set(event.userIds), reply: replyItems(event.userIds), replySeq: s.replySeq + 1 }));
     case 'room':

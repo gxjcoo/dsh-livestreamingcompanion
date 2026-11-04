@@ -359,6 +359,7 @@ export function apply(ctx: HostContext): void {
       if (!packs.template(String(patch.template))) return fail('没有这个模板');
       next.template = String(patch.template);
     }
+    if (patch.showTerminal !== undefined) next.showTerminal = !!patch.showTerminal;
     if (patch.voice !== undefined) next.voice = String(patch.voice).trim();
     if (patch.idleAfterSec !== undefined) next.idleAfterSec = Math.max(10, Math.min(600, Number(patch.idleAfterSec) || 45));
     if (patch.gameChatGapSec !== undefined) next.gameChatGapSec = Math.max(5, Math.min(120, Number(patch.gameChatGapSec) || 15));
@@ -400,6 +401,7 @@ export function apply(ctx: HostContext): void {
     // 换了 Python 或模型：关掉正在跑的识别进程，下次用新的
     if ((next.asrPython !== undefined && next.asrPython !== settings.asrPython) || (next.asrModel !== undefined && next.asrModel !== settings.asrModel)) asr.close();
     updateSettings(next);
+    if (next.showTerminal !== undefined) show.stage.broadcast({ type: 'terminal', visible: next.showTerminal });
     if (next.boardText !== undefined) publishBoard();
     if (next.noticeText !== undefined) publishNotice();
     if (next.character) show.setNames(currentCharacter()?.names ?? []);
