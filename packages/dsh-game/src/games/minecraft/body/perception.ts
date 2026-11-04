@@ -9,6 +9,7 @@ export interface MinecraftRawObservation {
   capturedAt: number;
   connection: MinecraftEnvironmentSnapshot['connection'];
   world?: MinecraftEnvironmentSnapshot['world'];
+  lighting?: MinecraftEnvironmentSnapshot['lighting'];
   body?: MinecraftEnvironmentSnapshot['body'];
   owner?: MinecraftEnvironmentSnapshot['owner'];
   follow?: MinecraftEnvironmentSnapshot['follow'];
@@ -24,6 +25,7 @@ export function buildMinecraftSnapshot(input: MinecraftRawObservation): Minecraf
     stale: !connected,
     connection: input.connection,
     world: connected ? input.world : undefined,
+    lighting: connected ? input.lighting : undefined,
     body: connected ? input.body : undefined,
     owner: connected ? input.owner : undefined,
     follow: input.follow ?? { phase: 'inactive' },

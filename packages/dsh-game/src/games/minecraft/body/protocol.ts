@@ -95,6 +95,13 @@ export type MinecraftRuntimeEvent =
   | { kind: 'build-progress'; text: string }
   /** 盖房子：这一格已经是图纸上的方块了（刚放好的，或者本来就是） */
   | { kind: 'build-placed'; x: number; y: number; z: number; name: string }
+  /**
+   * Foreground execute-action lifecycle barrier, not an action result or terminal outcome.
+   * Sent once, after the execute-action response, when its handler and all finally cleanup
+   * have completed. Correlate by actionId and ignore unknown/stale IDs. quick-action and
+   * cancel-action never emit this event.
+   */
+  | { kind: 'action-handler-settled'; actionId: string }
   | { kind: 'log'; level: 'info' | 'warn' | 'error'; message: string };
 
 export type MinecraftWorkerMessage =

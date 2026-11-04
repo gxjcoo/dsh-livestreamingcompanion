@@ -17,6 +17,7 @@ import {
 import { gatherWood } from './gatherWood.js';
 import { fleeFromHostiles, hideUnderground, sleepInBed, swimToShore } from './survival.js';
 import { buildStructure } from './build.js';
+import { secureBuildSite } from './buildSite.js';
 import { breedAnimals, farmPlot, harvestCrops, shearSheep } from './farming.js';
 import { digAt as digOne, useBucket, useOnBlock } from './useItems.js';
 import { flyTo, openSkySpots } from './flight.js';
@@ -43,6 +44,14 @@ import type {
   MinecraftStatus,
 } from './protocol.js';
 import { buildMinecraftSnapshot } from './perception.js';
+import {
+  assertTorchPlacementStillValid,
+  ensureLighting as runEnsureLighting,
+  LightingActionError,
+  sampleLighting,
+  torchFaceVector,
+  type TorchCandidate,
+} from './lighting.js';
 import { protectMovementsFromFalls, protectMovementsFromFluid } from './fluidSafety.js';
 import { runAbortableOperation } from './abortableOperation.js';
 import { patchedGoto, type PathfindResult } from './patchedGoto.js';
@@ -2129,6 +2138,42 @@ export function createMineflayerAdapter(
     }
   }
 
+  async function placeTorchForLighting(
+    current: any,
+    item: any,
+    candidate: TorchCandidate,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const target = new Vec3(candidate.target.x, candidate.target.y, candidate.target.z);
+    if (distanceToBot(current, target) > 4) {
+      const navigation = await patchedGoto(
+        current,
+        new goals.GoalNear(target.x, target.y, target.z, 3),
+        { signal },
+      );
+      if (!navigation.ok) {
+        const code = navigation.reason === 'noPath'
+          ? 'path_unreachable'
+          : navigation.reason === 'timeout'
+            ? 'timeout'
+            : navigation.reason === 'interrupted'
+              ? 'cancelled'
+              : navigation.reason === 'stagnation'
+                ? 'blocked'
+                : 'adapter_error';
+        throw new LightingActionError(code, `cannot reach torch target: ${navigation.message}`, {
+          position: candidate.target,
+          navigationReason: navigation.reason,
+          endPosition: navigation.endPos,
+          distanceToTarget: navigation.distanceToTarget,
+        });
+      }
+    }
+    assertTorchPlacementStillValid(current, candidate);
+    const preferredDir = torchFaceVector(candidate);
+    await airiPlaceBlockAt(current, item, target, placementFaceFor(preferredDir), { preferredDir, signal });
+  }
+
   function pickCraftRecipe(
     current: any,
     step: CraftPlanStep,
@@ -2607,6 +2652,24 @@ export function createMineflayerAdapter(
         place: async (item, target) => { await placeBlockAt(current, item, target, 'auto', options.signal); },
         dig: (target) => digAt(current, target, options.signal, true),
         pickup: async (radius) => { await collectItemDrops(radius, options.signal); },
+        secureSite: (site) => secureBuildSite(current, site, {
+          hostiles: () => visibleEntities(current).filter((entity) => entity.hostile),
+          navigate: (center, range, signal) => patchedGoto(current, new goals.GoalNear(center.x, center.y, center.z, range), { signal }),
+          ensureLighting: (protectedCells, signal) => runEnsureLighting(current, {
+            radius: 6,
+            verticalRadius: 2,
+            maxTorches: 8,
+            policy: 'spawn-risk',
+            protectedCells,
+            signal,
+            dimension: current.game?.dimension ?? current.dimension,
+            version: current.version,
+            timeOfDay: typeof current.time?.timeOfDay === 'number' ? current.time.timeOfDay : undefined,
+            place: (item, candidate, signal) => placeTorchForLighting(current, item, candidate, signal),
+          }),
+          equipWeapon: () => equipBestWeapon(current),
+          log: (text) => emit({ kind: 'log', level: 'warn', message: text }),
+        }),
         progress: (text) => emit({ kind: 'build-progress', text }),
         placed: (b) => emit({ kind: 'build-placed', x: b.x, y: b.y, z: b.z, name: b.name }),
         log: (text) => emit({ kind: 'log', level: 'warn', message: text }),
@@ -3164,6 +3227,17 @@ export function createMineflayerAdapter(
       return runPlaceBlock(options);
     },
 
+    async ensureLighting(options): Promise<MinecraftActionResult> {
+      const current = requireBot(bot);
+      return runEnsureLighting(current, {
+        ...options,
+        dimension: current.game?.dimension ?? current.dimension,
+        version: current.version,
+        timeOfDay: typeof current.time?.timeOfDay === 'number' ? current.time.timeOfDay : undefined,
+        place: (item, candidate, signal) => placeTorchForLighting(current, item, candidate, signal),
+      });
+    },
+
     async pickupDrops(options): Promise<MinecraftActionResult> {
       const started = Date.now();
       const { found, picked, inventoryDelta } = await collectItemDrops(options.radius);
@@ -3194,9 +3268,10 @@ function getRawObservation(
   owner: string | undefined,
 ): MinecraftRawObservation {
   const connected = Boolean(bot);
+  const capturedAt = Date.now();
   const ownerEntity = connected && owner ? bot.players?.[owner]?.entity : undefined;
   return {
-    capturedAt: Date.now(),
+    capturedAt,
     connection: {
       connected,
       username: bot?.username,
@@ -3204,6 +3279,7 @@ function getRawObservation(
       port: connection?.port,
     },
     world: connected ? worldSnapshot(bot) : undefined,
+    lighting: connected ? sampleLighting(bot, bot.entity?.position, capturedAt) : undefined,
     body: connected ? bodySnapshot(bot) : undefined,
     owner: owner
       ? {

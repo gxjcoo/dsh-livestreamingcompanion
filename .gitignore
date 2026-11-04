@@ -5,6 +5,8 @@ dist/
 .DS_Store
 Thumbs.db
 tools/.gen/
+.mc-server/
+.mc-benchmark/
 *.tsbuildinfo
 .env
 .env.*

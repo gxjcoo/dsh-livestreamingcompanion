@@ -2,7 +2,7 @@
  * dsh-game agent 子插件：给模型用的工具。挂在「大肥鱼玩游戏」预设下（见 cordis.patch.yml）。
  *
  *   game_start   打开游戏
- *   game_continue    等下一个时刻（发生的事、新画面、她现在能做的事），游戏在她处理时暂停
+ *   game_continue    等下一个时刻（发生的事、新画面、她现在能做的事）；回合制游戏会暂停，Minecraft 世界持续运行
  *   game_act     在游戏里做一件事（能做的事和参数由游戏在时刻里给出）
  *
  * 说话：她回复里写的文字就是她说出口的话（思考不念）。只有这一个出口，所以不会念重复：
@@ -275,7 +275,7 @@ export function apply(ctx: AgentContext): void {
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'game_continue',
-    description: '让游戏从停住的地方接着往下走，到下一个时刻再停下交给你：游戏里发生了一段值得你看的事，或者轮到你做事了。返回这段时间发生的事、新画面（截图）和你现在能做的事。不调用它，游戏就一直停在原处。每个时刻有编号。',
+    description: '读取 after 之后的下一个时刻：发生的事、新画面（截图）和你现在能做的事。回合制游戏会在这里继续推进；Minecraft 等实时游戏的世界始终运行，不调用它也不会暂停，要边行动边观察。每个时刻有递增编号，下次把本次编号填进 after。',
     parameters: {
       after: { type: 'integer', required: true, description: '你上一次看到的时刻编号（第一次填 0）' },
       ...MOOD_PARAMS,
@@ -301,7 +301,7 @@ export function apply(ctx: AgentContext): void {
       exec.signal.addEventListener('abort', cancel, { once: true });
       let liveCalling = false;
       onAir()?.attention(waiting.signal).then(() => { liveCalling = !waiting.signal.aborted; waiting.abort(); }, () => {});
-      const moment = await session.wait(waiting.signal, WAIT_MAX_MS);
+      const moment = await session.wait(waiting.signal, WAIT_MAX_MS, Math.max(0, Math.trunc(args.after)));
       exec.signal.removeEventListener('abort', cancel);
       waiting.abort();
       await voicing;
@@ -324,6 +324,7 @@ export function apply(ctx: AgentContext): void {
       index: { type: 'integer', description: '序号（从 1 开始），这件事要它时填' },
       name: { type: 'string', description: '名字，这件事要它时填' },
       text: { type: 'string', description: '文字，这件事要它时填' },
+      data: { type: 'object', additionalProperties: true, description: '结构化参数，只有时刻里明确要求 data 的动作才填；内容按该游戏的说明填写' },
       ...MOOD_PARAMS,
     },
     output: {
@@ -350,6 +351,7 @@ export function apply(ctx: AgentContext): void {
         ...(args.index !== undefined && args.index !== null ? { index: Number(args.index) } : {}),
         ...(typeof args.name === 'string' ? { name: args.name } : {}),
         ...(typeof args.text === 'string' ? { text: args.text } : {}),
+        ...(args.data !== undefined ? { data: args.data } : {}),
       };
       // 现在做不了：这次表态作废，她这条消息的话也不念（念了再被拒，听起来像自己打脸），直接把原因交给她
       const refusal = session.refuse?.(action);

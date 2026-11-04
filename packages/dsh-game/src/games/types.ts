@@ -8,8 +8,8 @@ import type { WolfEntry } from './werewolf/engine.js';
  *   - 平台（这里和 moment.ts、agent.ts 的工具说明）：时刻、「现在能做的事」、game_act 照着做。不出现任何游戏专属的词
  *   - 游戏（各游戏自己的目录）：背景和规则（facts）、每个时刻能做的事（actions）、在对的时候给的事实（notes）
  *
- * 节奏：会话把游戏里发生的事攒成一个个「时刻」（该你看了 / 轮到你了）。时刻准备好时游戏暂停，
- * agent 再调 game_continue 时游戏才继续，所以 agent 想多久、说多久都不会错过。
+ * 节奏：会话把游戏里发生的事攒成一个个「时刻」（该你看了 / 轮到你了）。回合制游戏在时刻准备好时暂停，
+ * agent 再调 game_continue 时继续；实时游戏（Minecraft）始终运行，思考和说话不会暂停世界。
  */
 
 /** 游戏在等她回答的提示 */
@@ -30,8 +30,8 @@ export interface GameActionSpec {
   action: string;
   /** 这件事是什么 */
   description: string;
-  /** 要填的参数 → 怎么填 */
-  params?: Partial<Record<'index' | 'name' | 'text', string>>;
+  /** 要填的参数 → 怎么填；data 只用于游戏明确说明过的结构化参数 */
+  params?: Partial<Record<'index' | 'name' | 'text' | 'data', string>>;
 }
 
 /** game_act 收到的一件事：action 加上游戏说明过的参数 */
@@ -40,6 +40,8 @@ export interface GameAction {
   index?: number;
   name?: string;
   text?: string;
+  /** 游戏自己的结构化参数；由该游戏严格校验，不把 JSON 藏进自然语言 text */
+  data?: Record<string, unknown>;
 }
 
 export interface Moment {
@@ -88,8 +90,8 @@ export interface GameSession {
   readonly facts: string;
   /** 装 mod、开游戏；返回给 agent 的说明 */
   start(): Promise<string>;
-  /** 等下一个时刻；signal 取消时立刻返回 timeout */
-  wait(signal: AbortSignal, maxMs: number): Promise<Moment>;
+  /** 等 after 之后的下一个时刻；signal 取消时立刻返回 timeout。after=0 表示第一次读取 */
+  wait(signal: AbortSignal, maxMs: number, after?: number): Promise<Moment>;
   act(action: GameAction): Promise<string>;
   /** 刚做完的那件事附带的图（Minecraft 图纸的渲染图）：取一次就没了 */
   takeImage?(): { data: Uint8Array; mediaType: 'image/png' | 'image/jpeg' } | null;
@@ -131,4 +133,24 @@ export type RunEvent =
   /** 别的角色说的话（狼人杀的其他玩家、法官）：seat 为 0 是法官 */
   | { type: 'voice'; seat: number; name: string; text: string; start: number; end: number; audio?: string; tag?: 'inner' | 'wolf' }
   /** 狼人杀牌桌上的一件事（发言、心声、夜里的行动、投票、死讯……） */
-  | { type: 'wolf'; entry: WolfEntry };
+  | { type: 'wolf'; entry: WolfEntry }
+  /** Minecraft 整局评测：关联同一前台动作，中文 label 只用于展示，不作为指标依据。 */
+  | {
+    type: 'minecraft_action'; phase: 'started' | 'settled'; runId: string; actionId: string;
+    action: string; label: string; planId?: string; stepId?: string; attempt?: number;
+    role?: 'skill' | 'recovery'; maintenance?: 'lighting'; outcome?: 'succeeded' | 'partial' | 'failed' | 'cancelled';
+    certainty?: 'certain' | 'uncertain'; errorCode?: string; recoverable?: boolean; durationMs?: number;
+    inventoryDelta?: Record<string, number>;
+    worldChanges?: { kind: string; name: string; count: number }[];
+    buildEvidence?: { completed: number; remaining: number; remainingClear: number; unloaded: number; temporaryBlocks: number };
+  }
+  /** 每次持久计划提交后的真实状态快照；用于完成率、失败循环和恢复率。 */
+  | {
+    type: 'minecraft_plan'; planId: string; revision: number; status: string;
+    steps: {
+      id: string; skill: string; status: string; attempts: number; recoveryAttempts: number;
+      noProgressAttempts: number; maxNoProgressAttempts: number;
+      failureCode?: string; failureFingerprint?: string; disposition?: string; certainty?: 'certain' | 'uncertain';
+    }[];
+  }
+  | { type: 'minecraft_death'; position?: { x: number; y: number; z: number } };

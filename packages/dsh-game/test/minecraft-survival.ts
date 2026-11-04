@@ -13,9 +13,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { MinecraftSession } from '../src/games/minecraft/session.js';
 import { RconLink, rcon as rconRaw, type RconTarget } from '../src/games/minecraft/rcon.js';
+import type { RunEvent } from '../src/games/types.js';
+import type { MinecraftPlan } from '../src/games/minecraft/plan.js';
 
 const ROOT = path.resolve(process.argv[2] ?? '.');
-/** 跑哪些：basic（基本操作）、edge（名字、配方回环、掉落和数量、氧气只算自己的；breath 只跑氧气这项）、build（盖房子）、farm（种地、养动物）、journal（世界日志）、nether（桶、黑曜石、下界传送门）、creative（形状图纸、创造模式一层层盖）、rcon（跟拍用的常开 RCON 连接：连发的命令每条都执行）、live（第一场直播报的身体问题）、不填 = 全部 */
+/** 跑哪些：basic（基本操作）、edge（名字、配方回环、掉落和数量、氧气只算自己的；breath 只跑氧气这项）、build（盖房子）、lighting（真实照明计划）、secure-build（敌人下安全施工）、resume（死亡与新建 session 续建）、failure-loop（不可达目标预算）、farm（种地、养动物）、journal（世界日志）、nether（桶、黑曜石、下界传送门）、creative（形状图纸、创造模式一层层盖）、rcon（跟拍用的常开 RCON 连接：连发的命令每条都执行）、live（第一场直播报的身体问题）、不填 = 全部 */
 const SUITE = process.argv[3] ?? 'all';
 const props = Object.fromEntries(
   fs.readFileSync(path.join(ROOT, '.mc-server', 'server.properties'), 'utf8').split(/\r?\n/)
@@ -32,6 +34,33 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const LOG = path.join(ROOT, 'packages', 'dsh-game', 'test', '.out', 'body.log');
 /** 测试用的世界日志目录（每次跑之前清空） */
 const JOURNAL_DIR = path.join(ROOT, 'packages', 'dsh-game', 'test', '.out', 'journal');
+/** Benchmark output is opt-in; ordinary self-tests keep their existing console-only behaviour. */
+const BENCHMARK_EVENTS = process.env.MC_BENCHMARK_EVENTS
+  ? path.resolve(ROOT, process.env.MC_BENCHMARK_EVENTS) : null;
+const BENCHMARK_RESULT = process.env.MC_BENCHMARK_RESULT
+  ? path.resolve(ROOT, process.env.MC_BENCHMARK_RESULT) : null;
+const RUN_STARTED_AT = Date.now();
+let eventOutputError: string | null = null;
+const runEvents: Array<RunEvent & { t: number }> = [];
+
+function prepareBenchmarkOutput(): void {
+  if (!BENCHMARK_EVENTS) return;
+  fs.mkdirSync(path.dirname(BENCHMARK_EVENTS), { recursive: true });
+  // Never append a new run to an old log: that would fabricate cross-run metrics.
+  fs.writeFileSync(BENCHMARK_EVENTS, '', { flag: 'wx' });
+}
+
+function record(event: RunEvent): void {
+  const stamped = { t: Date.now(), ...event };
+  runEvents.push(stamped);
+  if (!BENCHMARK_EVENTS) return;
+  try {
+    fs.appendFileSync(BENCHMARK_EVENTS, `${JSON.stringify(stamped)}\n`);
+  } catch (error) {
+    // Recording must not interrupt the body; the machine-readable result is failed below.
+    eventOutputError ??= (error as Error).message;
+  }
+}
 
 // ---------- 记录结果 ----------
 const results: { name: string; ok: boolean; notes: string[] }[] = [];
@@ -1609,13 +1638,13 @@ const CLIENT_DIR = (() => {
   }
 })();
 
-function newSession(creative = false): MinecraftSession {
+function newSession(creative = false, useRcon = true): MinecraftSession {
   return new MinecraftSession({
     creative,
     clientDir: CLIENT_DIR,
     workerPath: path.join(ROOT, 'packages', 'dsh-game', 'lib', 'minecraft-worker.cjs'),
     host: '127.0.0.1', port: Number(props['server-port'] || 25565), username: NAME,
-    record: () => {}, camera: null, rcon: RCON, journalDir: JOURNAL_DIR,
+    record, camera: null, rcon: useRcon ? RCON : null, journalDir: JOURNAL_DIR,
     log: (text) => fs.appendFileSync(LOG, `${new Date().toISOString()} ${text}\n`),
   });
 }
@@ -1623,6 +1652,7 @@ function newSession(creative = false): MinecraftSession {
 let firstStart = '';
 
 async function main(): Promise<void> {
+  prepareBenchmarkOutput();
   const mobSpawning = (await rcon('gamerule doMobSpawning')).match(/(true|false)/)?.[1] ?? 'true';
   await rcon('gamerule doMobSpawning false');
   await rcon('time set day');
@@ -1641,6 +1671,10 @@ async function main(): Promise<void> {
     if (SUITE === 'all' || SUITE === 'rcon') await rconCases();
     if (SUITE === 'all' || SUITE === 'live') await liveCases();
     if (SUITE === 'all' || SUITE === 'build') await buildCases();
+    if (SUITE === 'all' || SUITE === 'lighting') await lightingCases();
+    if (SUITE === 'all' || SUITE === 'secure-build') await secureBuildCases();
+    if (SUITE === 'all' || SUITE === 'resume') await resumeCases();
+    if (SUITE === 'all' || SUITE === 'failure-loop') await failureLoopCases();
     if (SUITE === 'all' || SUITE === 'farm') await farmCases();
     if (SUITE === 'all' || SUITE === 'journal') await journalCases();
     if (SUITE === 'all' || SUITE === 'nether') await netherCases();
@@ -1652,6 +1686,232 @@ async function main(): Promise<void> {
     await rcon('time set day');
   }
   report();
+}
+
+// ---------- 结构化生存技能：RCON 只属于外部 harness，被测 session 没有 RCON ----------
+async function eventually<T>(
+  probe: () => T | null | false | undefined | Promise<T | null | false | undefined>,
+  timeoutMs: number,
+): Promise<T | null> {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    const value = await probe();
+    if (value !== null && value !== false && value !== undefined) return value;
+    await sleep(250);
+  }
+  return null;
+}
+
+function currentPlan(): MinecraftPlan | null {
+  return (session as any).plan ?? null;
+}
+
+async function submitPlan(
+  id: string,
+  goal: string,
+  steps: Array<Record<string, unknown>>,
+  mode: 'active' | 'shadow' = 'active',
+): Promise<string> {
+  const reply = await session.act({ action: 'plan', data: { id, mode, goal, steps } });
+  note(`plan ${id} → ${reply.slice(0, 240)}`);
+  return reply;
+}
+
+async function waitPlan(id: string, timeoutMs = 240_000): Promise<MinecraftPlan | null> {
+  return eventually(() => {
+    const plan = currentPlan();
+    return plan?.id === id && (plan.status === 'done' || plan.status === 'blocked') ? plan : null;
+  }, timeoutMs);
+}
+
+/** Reset only the external arena. The new survival session cannot give, setblock, fill, or teleport. */
+async function prepareSurvivalSkillArena(): Promise<void> {
+  await session.stop().catch(() => {});
+  await rcon('kill @e[tag=dsh_ghost]');
+  await rcon(`kill @e[type=!player,x=${X},y=${Y},z=${Z},distance=..40]`);
+  await rcon(`fill ${X - 9} ${Y + 1} ${Z - 9} ${X + 9} ${Y + 6} ${Z + 9} air`);
+  // An opaque roof makes this a genuine covered/night lighting scenario, not daylight visibility.
+  await rcon(`fill ${X - 6} ${Y + 5} ${Z - 6} ${X + 6} ${Y + 5} ${Z + 6} stone`);
+  await rcon('time set 14000');
+  await reset();
+  await rcon(`tp ${NAME} ${X} ${Y + 1} ${Z}`);
+  await sleep(1500);
+  session = newSession(false, false);
+  await session.start();
+  await sleep(1000);
+}
+
+async function lightingCases(): Promise<void> {
+  begin('结构化照明：夜间有顶场地，远处目标由 Mineflayer 逐格光照验收');
+  await prepareSurvivalSkillArena();
+  await rcon(`give ${NAME} torch 8`);
+  await sleep(800);
+  const target = { x: X + 3, y: Y + 1, z: Z, dimension: 'overworld' };
+  const id = 'benchmark-lighting';
+  await submitPlan(id, 'Light the covered work area with carried torches', [{
+    id: 'main', skill: 'ensure_lighting',
+    args: { radius: 4, verticalRadius: 2, maxTorches: 4, policy: 'spawn-risk' },
+    completion: { type: 'block_light_at_least', position: target, minimum: 1 },
+  }]);
+  const plan = await waitPlan(id);
+  check(plan?.status === 'done', `照明计划完成（实际 ${plan?.status ?? '超时'}）`);
+  const cells: { x: number; y: number; z: number }[] = [];
+  for (let x = X - 4; x <= X + 4; x++) for (let y = Y + 1; y <= Y + 3; y++) for (let z = Z - 4; z <= Z + 4; z++) {
+    cells.push({ x, y, z });
+  }
+  const torches = await countBlocks(cells, 'torch') + await countBlocks(cells, 'wall_torch');
+  check(torches > 0, `服务器里真的放了火把（${torches}）`);
+  const observations = [...((session as any).lightingEvidence?.values?.() ?? [])] as any[];
+  const observed = observations.find((sample) => sample.x === target.x && sample.y === target.y
+    && sample.z === target.z && sample.dimension === 'overworld');
+  check(observed?.loaded === true && observed.blockLight >= 1,
+    `目标格的 Mineflayer 扫描为 loaded=true 且 blockLight>=1（${JSON.stringify(observed ?? null)}）`);
+
+  begin('结构化照明：没有火把和原料时不虚报完成');
+  await reset();
+  await rcon(`fill ${X - 5} ${Y + 1} ${Z - 5} ${X + 5} ${Y + 4} ${Z + 5} air replace torch`);
+  await rcon(`fill ${X - 5} ${Y + 1} ${Z - 5} ${X + 5} ${Y + 4} ${Z + 5} air replace wall_torch`);
+  await sleep(800);
+  const deficitId = 'benchmark-lighting-deficit';
+  await submitPlan(deficitId, 'Report a real torch deficit instead of claiming light', [{
+    id: 'main', skill: 'ensure_lighting', maxAttempts: 1,
+    args: { radius: 3, verticalRadius: 2, maxTorches: 2, policy: 'spawn-risk' },
+    completion: { type: 'block_light_at_least', position: target, minimum: 1 },
+  }]);
+  const deficit = await waitPlan(deficitId, 150_000);
+  check(deficit?.status === 'blocked' && deficit.steps[0]?.status !== 'done',
+    `缺口进入有界阻塞而不是成功（${deficit?.status ?? '超时'}：${deficit?.steps[0]?.lastFailure?.code ?? 'none'}）`);
+  check(await countBlocks(cells, 'torch') + await countBlocks(cells, 'wall_torch') === 0,
+    '没有物资时服务器里也没有凭空出现火把');
+}
+
+function benchmarkWall(id: string, width: number, height: number): {
+  blueprintId: string;
+  origin: { x: number; y: number; z: number };
+  blocks: Array<{ x: number; y: number; z: number; name: string; props: Record<string, never> }>;
+} {
+  const origin = { x: X - Math.floor(width / 2), y: Y + 1, z: Z + 3 };
+  const blocks = [];
+  for (let x = 0; x < width; x++) for (let y = 0; y < height; y++) {
+    blocks.push({ x: origin.x + x, y: origin.y + y, z: origin.z, name: 'cobblestone', props: {} });
+  }
+  return { blueprintId: id, origin, blocks };
+}
+
+function buildStep(wall: ReturnType<typeof benchmarkWall>): Record<string, unknown> {
+  return {
+    id: 'main', skill: 'build_resume', maxAttempts: 4,
+    args: { ...wall, label: wall.blueprintId, clear: [], ownedTemporary: [] },
+    completion: { type: 'blueprint_complete', blueprintId: wall.blueprintId },
+  };
+}
+
+async function secureBuildCases(): Promise<void> {
+  begin('安全施工：敌人威胁先防御，再从真实图纸差量继续');
+  await prepareSurvivalSkillArena();
+  await rcon(`give ${NAME} cobblestone 64`);
+  await rcon(`give ${NAME} torch 16`);
+  await rcon(`give ${NAME} stone_sword 1`);
+  await rcon(`give ${NAME} bread 4`);
+  await rcon(`summon zombie ${X + 3} ${Y + 1} ${Z + 3} {PersistenceRequired:1b,NoAI:1b}`);
+  await sleep(1000);
+  const id = 'benchmark-secure-build';
+  const wall = benchmarkWall(id, 6, 4);
+  await submitPlan(id, 'Secure and finish a generic cobblestone wall', [buildStep(wall)]);
+  const plan = await waitPlan(id, 360_000);
+  check(plan?.status === 'done', `施工计划完成（实际 ${plan?.status ?? '超时'}：${plan?.steps[0]?.lastFailure?.code ?? 'none'}）`);
+  check(await countBlocks(wall.blocks, 'cobblestone') === wall.blocks.length,
+    `服务器图纸差量为零（${await countBlocks(wall.blocks, 'cobblestone')}/${wall.blocks.length}）`);
+  check(await countEntities('zombie') === 0, '威胁施工的僵尸已被清除');
+  const actions = runEvents.filter((event): event is Extract<RunEvent, { type: 'minecraft_action' }> & { t: number } =>
+    event.type === 'minecraft_action' && event.planId === id);
+  check(actions.some((event) => event.phase === 'settled' && event.action === 'build_structure'
+    && event.outcome === 'failed' && event.errorCode === 'unsafe'), '安全门槛确实拒绝过有敌人的施工');
+  check(actions.some((event) => event.phase === 'settled' && event.role === 'recovery'
+    && event.outcome === 'succeeded'), '防御恢复动作真实完成，而非只口头说安全');
+  check(actions.some((event) => event.phase === 'settled' && event.action === 'build_structure'
+    && event.outcome === 'succeeded' && event.buildEvidence?.remaining === 0
+    && event.buildEvidence.remainingClear === 0 && event.buildEvidence.unloaded === 0),
+  '最终建造结果带完整图纸与加载证据');
+  await rcon(`kill @e[type=zombie,x=${X},y=${Y},z=${Z},distance=..40]`);
+}
+
+async function resumeCases(): Promise<void> {
+  begin('断点续建：真实放置后死亡，新建 session 重读世界并完成同一图纸');
+  const keepInventory = (await rcon('gamerule keepInventory')).match(/(true|false)/)?.[1] ?? 'false';
+  try {
+    await prepareSurvivalSkillArena();
+    await rcon('gamerule keepInventory true');
+    await rcon(`give ${NAME} cobblestone 96`);
+    await rcon(`give ${NAME} torch 16`);
+    await rcon(`give ${NAME} stone_sword 1`);
+    await rcon(`give ${NAME} bread 4`);
+    await sleep(800);
+    const id = 'benchmark-resume-build';
+    const wall = benchmarkWall(id, 8, 6);
+    const step = buildStep(wall);
+    await submitPlan(id, 'Resume the same wall after death and a new session', [step]);
+    const finished = waitPlan(id, 420_000);
+    const placedBefore = await eventually(async () => {
+      const placed = await countBlocks(wall.blocks, 'cobblestone');
+      return placed > 0 && placed < wall.blocks.length ? placed : null;
+    }, 180_000);
+    check(placedBefore !== null, `中断前已有真实施工进展（${placedBefore ?? 0}/${wall.blocks.length}）`);
+    const deathAfter = Date.now();
+    await rcon(`kill ${NAME}`);
+    const death = await eventually(() => runEvents.find((event) =>
+      event.type === 'minecraft_death' && event.t >= deathAfter) ?? null, 20_000);
+    check(!!death, 'worker 死亡形成了结构化事件');
+    await sleep(1500);
+    await session.stop();
+    session = newSession(false, false);
+    await session.start();
+    await sleep(1000);
+    // Same definition/handoff ID: restore the persisted owner, never create a replacement job.
+    await submitPlan(id, 'Resume the same wall after death and a new session', [step]);
+    const plan = await finished;
+    check(plan?.status === 'done', `新 session 续建完成（实际 ${plan?.status ?? '超时'}：${plan?.steps[0]?.lastFailure?.code ?? 'none'}）`);
+    check(await countBlocks(wall.blocks, 'cobblestone') === wall.blocks.length,
+      `重读世界后的最终图纸差量为零（${await countBlocks(wall.blocks, 'cobblestone')}/${wall.blocks.length}）`);
+    check(!(session as any).journal?.activeJob, '完成后持久建造 job 已清除');
+  } finally {
+    await rcon(`gamerule keepInventory ${keepInventory}`);
+  }
+}
+
+async function failureLoopCases(): Promise<void> {
+  begin('失败预算：基岩封死目标，不能无限重试或假报到达');
+  await prepareSurvivalSkillArena();
+  const target = { x: X + 7, y: Y + 1, z: Z + 7, dimension: 'overworld' };
+  await rcon(`fill ${target.x - 1} ${target.y} ${target.z - 1} ${target.x + 1} ${target.y + 3} ${target.z + 1} bedrock`);
+  await rcon(`fill ${target.x} ${target.y + 1} ${target.z} ${target.x} ${target.y + 2} ${target.z} air`);
+  await sleep(800);
+  const id = 'benchmark-failure-loop';
+  await submitPlan(id, 'Stop with a bounded, explicit unreachable-target failure', [{
+    id: 'main', skill: 'recover_after_death', maxAttempts: 2, maxNoProgressAttempts: 2,
+    args: { position: target, range: 0, radius: 4 },
+    completion: { type: 'near_position', position: target, radius: 0 },
+  }]);
+  const plan = await eventually(() => {
+    const candidate = currentPlan();
+    if (candidate?.id !== id) return null;
+    const step = candidate.steps[0];
+    if (candidate.status === 'done' || candidate.status === 'blocked') return candidate;
+    return step?.attempts >= 2 && step.status === 'blocked' && !step.pendingRecovery
+      && step.nextRetryAt === undefined ? candidate : null;
+  }, 180_000);
+  if (!plan) await session.act({ action: 'stop' });
+  const step = plan?.steps[0];
+  check(!!plan && plan.status !== 'done' && !!step && step.attempts <= 2
+    && step.status === 'blocked' && step.nextRetryAt === undefined,
+  `不可达目标在预算内停止（${plan?.status ?? '超时'}，attempts=${step?.attempts ?? '?'}，failure=${step?.lastFailure?.code ?? 'none'}）`);
+  const started = runEvents.filter((event) => event.type === 'minecraft_action'
+    && event.phase === 'started' && event.planId === id).length;
+  await sleep(3000);
+  const after = runEvents.filter((event) => event.type === 'minecraft_action'
+    && event.phase === 'started' && event.planId === id).length;
+  check(started > 0 && started <= 2 && after === started,
+    `没有静默动作循环（预算内 ${started} 次，等待后 ${after} 次）`);
 }
 
 /** 基本操作：采集、合成、熔炼、排队、放置、寻找、装备、丢捡、战斗、吃、躲、睡、逃、停 */
@@ -1790,15 +2050,41 @@ async function basicCases(): Promise<void> {
   }
 }
 
-function report(): void {
+function report(fatal?: unknown): void {
   console.log('\n========== 结果');
   for (const r of results) console.log(`${r.ok ? '通过' : '失败'}  ${r.name}${r.notes.length ? `\n      ${r.notes.join('\n      ')}` : ''}`);
   const failed = results.filter((r) => !r.ok).length;
+  if (fatal) console.error(fatal);
+  if (eventOutputError) console.error(`RunEvent 写入失败：${eventOutputError}`);
   console.log(`\n${results.length - failed}/${results.length} 项通过`);
-  process.exit(failed ? 1 : 0);
+  if (BENCHMARK_RESULT) {
+    const result = {
+      schemaVersion: 1,
+      suite: SUITE,
+      run: Number(process.env.MC_BENCHMARK_RUN) || null,
+      startedAt: RUN_STARTED_AT,
+      endedAt: Date.now(),
+      ok: !fatal && !eventOutputError && failed === 0,
+      scenarios: results,
+      eventsFile: BENCHMARK_EVENTS ? path.basename(BENCHMARK_EVENTS) : null,
+      ...(fatal ? { error: {
+        name: fatal instanceof Error ? fatal.name : 'Error',
+        message: fatal instanceof Error ? fatal.message : String(fatal),
+      } } : {}),
+      ...(eventOutputError ? { eventOutputError } : {}),
+    };
+    try {
+      fs.mkdirSync(path.dirname(BENCHMARK_RESULT), { recursive: true });
+      fs.writeFileSync(BENCHMARK_RESULT, `${JSON.stringify(result, null, 2)}\n`, { flag: 'wx' });
+    } catch (error) {
+      console.error(`无法写入 benchmark result：${(error as Error).message}`);
+      process.exitCode = 2;
+      return;
+    }
+  }
+  process.exitCode = fatal ? 2 : failed || eventOutputError ? 1 : 0;
 }
 
 main().catch((err) => {
-  console.error(err);
-  process.exit(2);
+  report(err);
 });

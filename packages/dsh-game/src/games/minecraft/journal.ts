@@ -6,11 +6,24 @@
  *   身体自动记的（做完、结果明确的事）：盖过的建筑、种的地、睡过的床、死在哪、这局结束时在哪做什么
  *   背包变化、聊天、每个时刻的状态不记（那些是流水，不是日志）
  *
+ * v2 另外保存一个结构化计划和一个施工 job。施工只保存完整图纸、阶段和临时块所有权，
+ * 不保存逐块进度游标；恢复后必须重新读取世界求差量。
+ *
  * 开了 RCON 时记下世界种子：下次开局种子对不上（服务器换了新世界），旧日志改名留着，开一本新的。
  * 上限：地点、建筑、地各 30 条（开局只给她看最近 10 条，journal 看全部），图纸 20 张（丢最久没用的），死亡留最近 5 次。
  */
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import type { BuildBlock, BuildTemporaryBlock } from './body/build.js';
+import {
+  canonicalJson,
+  migratePlan,
+  parsePlan,
+  planDefinition,
+  type MinecraftPlan,
+  type PlanIdAndTime,
+} from './plan.js';
 
 interface Spot {
   x: number;
@@ -19,8 +32,88 @@ interface Spot {
   dimension: string;
 }
 
+export interface MinecraftBuildBlockPosition {
+  x: number;
+  y: number;
+  z: number;
+}
+
+export const MINECRAFT_BUILD_PHASES = [
+  'SECURING',
+  'BUILDING',
+  'DEFENDING',
+  'RECOVERING',
+  'RESECURING',
+  'BLOCKED',
+  'DONE',
+  'ABANDONED',
+] as const;
+export type MinecraftBuildPhase = (typeof MINECRAFT_BUILD_PHASES)[number];
+
+/** JSON-only resumable work. There is deliberately no per-block completion cursor. */
+export interface MinecraftBuildJob {
+  id: string;
+  planId?: string;
+  stepId?: string;
+  label: string;
+  dimension: string;
+  /** Canonically ordered; the builder still re-reads the world before doing any work. */
+  blocks: BuildBlock[];
+  clear: MinecraftBuildBlockPosition[];
+  /** SHA-256 of canonical dimension + blocks + clear content. */
+  contentHash: string;
+  origin?: MinecraftBuildBlockPosition;
+  phase: MinecraftBuildPhase;
+  interruptionReason?: string;
+  /** Only blocks whose placement was actually observed for this job belong here. */
+  ownedTemporary: BuildTemporaryBlock[];
+  attempts: number;
+  maxAttempts: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface MinecraftBuildJobInput {
+  id?: string;
+  planId?: string;
+  stepId?: string;
+  label: string;
+  dimension: string;
+  blocks: readonly BuildBlock[];
+  clear: readonly MinecraftBuildBlockPosition[];
+  origin?: MinecraftBuildBlockPosition;
+  phase?: MinecraftBuildPhase;
+  interruptionReason?: string;
+  ownedTemporary?: readonly BuildTemporaryBlock[];
+  attempts?: number;
+  maxAttempts?: number;
+  /** Injectable for deterministic callers/tests; not persisted as an extra field. */
+  now?: number;
+}
+
+export interface MinecraftBuildJobUpdate {
+  phase?: MinecraftBuildPhase;
+  /** null explicitly clears both the reason and the interrupted state. */
+  interruptionReason?: string | null;
+  ownedTemporary?: readonly BuildTemporaryBlock[];
+  /** Absolute, monotonically nondecreasing attempt count (not a progress cursor). */
+  attempts?: number;
+  maxAttempts?: number;
+  /** Injectable for deterministic callers/tests; not persisted as an extra field. */
+  now?: number;
+}
+
+export type MinecraftPlanMode = 'shadow' | 'active';
+
+export interface MinecraftPlanReceipt {
+  id: string;
+  definitionHash: string;
+  status: MinecraftPlan['status'];
+  updatedAt: number;
+}
+
 interface JournalData {
-  version: 1;
+  version: 2;
   server: string;
   username: string;
   seed?: string;
@@ -37,12 +130,24 @@ interface JournalData {
   /** 走过的传送门：两头的位置 */
   portals?: { a: Spot; b: Spot; at: number }[];
   last?: Spot & { at: number; doing?: string; inventory?: string };
+  activePlan?: MinecraftPlan;
+  planMode?: MinecraftPlanMode;
+  /** Durable idempotent handoff receipts, including plans no longer active. */
+  planReceipts?: MinecraftPlanReceipt[];
+  activeJob?: MinecraftBuildJob;
 }
 
 const MAX_LIST = 30;
 const SHOWN = 10;
 const MAX_DESIGNS = 20;
 const MAX_DEATHS = 5;
+const MAX_BUILD_ARRAY = 100_000;
+const MAX_BUILD_PROPS = 64;
+const MAX_ATTEMPTS = 1_000;
+const MAX_PLAN_STEPS = 1_000;
+const MAX_PLAN_ARRAY = 10_000;
+const MAX_PLAN_JSON_NODES = 200_000;
+const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
 const DIMENSIONS: Record<string, string> = { overworld: '主世界', the_nether: '下界', the_end: '末地' };
 export const dimensionName = (d: string): string => DIMENSIONS[d.replace('minecraft:', '')] ?? d;
@@ -67,26 +172,392 @@ function setAside(file: string, why: string): void {
   fs.renameSync(file, file.replace(/\.json$/, `.${why}-${stamp}.json`));
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function record(value: unknown, name: string): Record<string, unknown> {
+  if (!isRecord(value)) throw new TypeError(`${name} must be a plain object`);
+  return value;
+}
+
+function text(value: unknown, name: string, allowEmpty = false): string {
+  if (typeof value !== 'string' || (!allowEmpty && !value.trim())) {
+    throw new TypeError(`${name} must be ${allowEmpty ? 'a string' : 'a non-empty string'}`);
+  }
+  return value;
+}
+
+function finiteNumber(value: unknown, name: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`${name} must be a finite number`);
+  return value;
+}
+
+function integer(value: unknown, name: string, minimum = 0, maximum = Number.MAX_SAFE_INTEGER): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new RangeError(`${name} must be a safe integer between ${minimum} and ${maximum}`);
+  }
+  return value;
+}
+
+function timestamp(value: unknown, name: string): number {
+  return integer(value, name, 0);
+}
+
+function boundedArray(value: unknown, name: string, maximum: number): unknown[] {
+  if (!Array.isArray(value)) throw new TypeError(`${name} must be an array`);
+  if (value.length > maximum) throw new RangeError(`${name} exceeds the ${maximum} entry limit`);
+  return value;
+}
+
+function blockPosition(value: unknown, name: string): MinecraftBuildBlockPosition {
+  const r = record(value, name);
+  return {
+    x: integer(r.x, `${name}.x`, Number.MIN_SAFE_INTEGER),
+    y: integer(r.y, `${name}.y`, Number.MIN_SAFE_INTEGER),
+    z: integer(r.z, `${name}.z`, Number.MIN_SAFE_INTEGER),
+  };
+}
+
+function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function comparePosition(a: MinecraftBuildBlockPosition, b: MinecraftBuildBlockPosition): number {
+  return a.x - b.x || a.y - b.y || a.z - b.z;
+}
+
+function canonicalBlocks(value: unknown): BuildBlock[] {
+  const blocks = boundedArray(value, 'job.blocks', MAX_BUILD_ARRAY).map((entry, index) => {
+    const name = `job.blocks[${index}]`;
+    const r = record(entry, name);
+    const source = record(r.props, `${name}.props`);
+    const keys = Object.keys(source);
+    if (keys.length > MAX_BUILD_PROPS) throw new RangeError(`${name}.props exceeds the ${MAX_BUILD_PROPS} entry limit`);
+    const props: Record<string, string> = {};
+    for (const key of keys.sort()) {
+      if (FORBIDDEN_KEYS.has(key)) throw new TypeError(`${name}.props contains forbidden key ${JSON.stringify(key)}`);
+      props[key] = text(source[key], `${name}.props.${key}`, true);
+    }
+    return {
+      ...blockPosition(r, name),
+      name: text(r.name, `${name}.name`),
+      props,
+    };
+  });
+  const decorated = blocks.map((block) => ({ block, props: canonicalJson(block.props) }));
+  decorated.sort((a, b) => comparePosition(a.block, b.block)
+    || compareText(a.block.name, b.block.name)
+    || compareText(a.props, b.props));
+  return decorated.map(({ block }) => block);
+}
+
+function canonicalClear(value: unknown): MinecraftBuildBlockPosition[] {
+  return boundedArray(value, 'job.clear', MAX_BUILD_ARRAY)
+    .map((entry, index) => blockPosition(entry, `job.clear[${index}]`))
+    .sort(comparePosition);
+}
+
+function canonicalTemporary(value: unknown): BuildTemporaryBlock[] {
+  const temporary = boundedArray(value, 'job.ownedTemporary', MAX_BUILD_ARRAY).map((entry, index) => {
+    const name = `job.ownedTemporary[${index}]`;
+    const r = record(entry, name);
+    return { ...blockPosition(r, name), name: text(r.name, `${name}.name`) };
+  }).sort((a, b) => comparePosition(a, b) || compareText(a.name, b.name));
+  const occupied = new Set<string>();
+  for (const block of temporary) {
+    const key = `${block.x},${block.y},${block.z}`;
+    if (occupied.has(key)) throw new TypeError(`job.ownedTemporary contains duplicate position ${key}`);
+    occupied.add(key);
+  }
+  return temporary;
+}
+
+function buildContentHash(dimension: string, blocks: BuildBlock[], clear: MinecraftBuildBlockPosition[]): string {
+  return createHash('sha256').update(canonicalJson({ dimension, blocks, clear })).digest('hex');
+}
+
+/** Hash a fresh request exactly as it will be persisted, including canonical array order. */
+export function buildRequestHash(
+  dimension: string,
+  blocks: readonly BuildBlock[],
+  clear: readonly MinecraftBuildBlockPosition[],
+): string {
+  return buildContentHash(dimension, canonicalBlocks(blocks), canonicalClear(clear));
+}
+
+export function planDefinitionHash(plan: MinecraftPlan): string {
+  return createHash('sha256').update(canonicalJson(planDefinition(plan))).digest('hex');
+}
+
+function optionalId(value: unknown, name: string): string | undefined {
+  return value === undefined ? undefined : text(value, name);
+}
+
+/** Explicit field construction strips signals, callbacks and accidental progress metadata. */
+function parseBuildJob(value: unknown): MinecraftBuildJob {
+  const r = record(value, 'job');
+  const dimension = text(r.dimension, 'job.dimension');
+  const blocks = canonicalBlocks(r.blocks);
+  const clear = canonicalClear(r.clear);
+  const contentHash = buildContentHash(dimension, blocks, clear);
+  if (r.contentHash !== contentHash) throw new TypeError('job.contentHash does not match its canonical content');
+  const phase = text(r.phase, 'job.phase') as MinecraftBuildPhase;
+  if (!(MINECRAFT_BUILD_PHASES as readonly string[]).includes(phase)) throw new TypeError('job.phase is invalid');
+  const maxAttempts = integer(r.maxAttempts, 'job.maxAttempts', 1, MAX_ATTEMPTS);
+  const createdAt = timestamp(r.createdAt, 'job.createdAt');
+  const updatedAt = timestamp(r.updatedAt, 'job.updatedAt');
+  if (updatedAt < createdAt) throw new RangeError('job.updatedAt must not precede createdAt');
+  const planId = optionalId(r.planId, 'job.planId');
+  const stepId = optionalId(r.stepId, 'job.stepId');
+  const origin = r.origin === undefined ? undefined : blockPosition(r.origin, 'job.origin');
+  const interruptionReason = r.interruptionReason === undefined
+    ? undefined
+    : text(r.interruptionReason, 'job.interruptionReason');
+  return {
+    id: text(r.id, 'job.id'),
+    ...(planId === undefined ? {} : { planId }),
+    ...(stepId === undefined ? {} : { stepId }),
+    label: text(r.label, 'job.label'),
+    dimension,
+    blocks,
+    clear,
+    contentHash,
+    ...(origin ? { origin } : {}),
+    phase,
+    ...(interruptionReason === undefined ? {} : { interruptionReason }),
+    ownedTemporary: canonicalTemporary(r.ownedTemporary),
+    attempts: integer(r.attempts, 'job.attempts', 0, maxAttempts),
+    maxAttempts,
+    createdAt,
+    updatedAt,
+  };
+}
+
+/**
+ * Bound work before the plan parser recursively normalizes untrusted persisted JSON.
+ * This rejects oversized plans rather than truncating dependencies or attempt state.
+ */
+function assertBoundedPlan(value: unknown): void {
+  if (!isRecord(value)) return;
+  if (Array.isArray(value.steps) && value.steps.length > MAX_PLAN_STEPS) {
+    throw new RangeError(`plan.steps exceeds the ${MAX_PLAN_STEPS} entry limit`);
+  }
+  const pending: { value: unknown; depth: number }[] = [{ value, depth: 0 }];
+  let nodes = 0;
+  while (pending.length) {
+    const current = pending.pop()!;
+    nodes++;
+    if (nodes > MAX_PLAN_JSON_NODES) throw new RangeError('plan contains too many JSON values');
+    if (current.depth > 64) throw new RangeError('plan is nested too deeply');
+    if (Array.isArray(current.value)) {
+      if (current.value.length > MAX_PLAN_ARRAY) throw new RangeError(`plan array exceeds the ${MAX_PLAN_ARRAY} entry limit`);
+      for (const entry of current.value) pending.push({ value: entry, depth: current.depth + 1 });
+    } else if (isRecord(current.value)) {
+      for (const key of Object.keys(current.value)) {
+        pending.push({ value: current.value[key], depth: current.depth + 1 });
+      }
+    }
+  }
+}
+
+function restoredPlan(value: unknown): MinecraftPlan {
+  assertBoundedPlan(value);
+  return parsePlan(value);
+}
+
+function snapshot<T>(value: T): T {
+  return structuredClone(value);
+}
+
+function legacySpot(value: unknown): Spot {
+  const r = record(value, 'spot');
+  return {
+    x: finiteNumber(r.x, 'spot.x'),
+    y: finiteNumber(r.y, 'spot.y'),
+    z: finiteNumber(r.z, 'spot.z'),
+    dimension: text(r.dimension, 'spot.dimension', true),
+  };
+}
+
+function legacyList<T>(value: unknown, maximum: number, convert: (entry: unknown) => T): T[] {
+  if (!Array.isArray(value)) return [];
+  const result: T[] = [];
+  for (const entry of value.slice(0, maximum)) {
+    try {
+      result.push(convert(entry));
+    } catch {
+      // A damaged entry must not make the rest of an old journal unreadable.
+    }
+  }
+  return result;
+}
+
+function legacyOptional<T>(value: unknown, convert: (entry: unknown) => T): T | undefined {
+  if (value === undefined) return undefined;
+  try {
+    return convert(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function freshData(server: string, username: string, seed?: string | null): JournalData {
+  return {
+    version: 2,
+    server,
+    username,
+    ...(seed ? { seed } : {}),
+    sessions: 0,
+    designs: [],
+    buildings: [],
+    fields: [],
+    places: [],
+    deaths: [],
+    deathCount: 0,
+  };
+}
+
+/** Migrate and defensively copy persisted data, retaining v1's display fields and ordering. */
+function migrateJournal(raw: Record<string, unknown>, server: string, username: string, seed?: string | null): JournalData {
+  const data = freshData(server, username, seed);
+  if (typeof raw.seed === 'string' && !seed) data.seed = raw.seed;
+  if (typeof raw.sessions === 'number' && Number.isSafeInteger(raw.sessions) && raw.sessions >= 0) data.sessions = raw.sessions;
+  if (typeof raw.goal === 'string') data.goal = raw.goal;
+  data.designs = legacyList(raw.designs, MAX_DESIGNS, (entry) => {
+    const r = record(entry, 'design');
+    return {
+      name: text(r.name, 'design.name', true),
+      text: text(r.text, 'design.text', true),
+      usedAt: finiteNumber(r.usedAt, 'design.usedAt'),
+    };
+  });
+  data.buildings = legacyList(raw.buildings, MAX_LIST, (entry) => {
+    const r = record(entry, 'building');
+    return {
+      name: text(r.name, 'building.name', true),
+      ...legacySpot(r),
+      done: finiteNumber(r.done, 'building.done'),
+      total: finiteNumber(r.total, 'building.total'),
+      at: finiteNumber(r.at, 'building.at'),
+    };
+  });
+  data.fields = legacyList(raw.fields, MAX_LIST, (entry) => {
+    const r = record(entry, 'field');
+    return {
+      crop: text(r.crop, 'field.crop', true),
+      ...legacySpot(r),
+      size: finiteNumber(r.size, 'field.size'),
+      at: finiteNumber(r.at, 'field.at'),
+    };
+  });
+  data.places = legacyList(raw.places, MAX_LIST, (entry) => {
+    const r = record(entry, 'place');
+    return {
+      name: text(r.name, 'place.name', true),
+      ...legacySpot(r),
+      at: finiteNumber(r.at, 'place.at'),
+    };
+  });
+  data.deaths = legacyList(raw.deaths, MAX_DEATHS, (entry) => ({
+    ...legacySpot(entry),
+    at: finiteNumber(record(entry, 'death').at, 'death.at'),
+  }));
+  if (typeof raw.deathCount === 'number' && Number.isSafeInteger(raw.deathCount) && raw.deathCount >= 0) {
+    data.deathCount = raw.deathCount;
+  }
+  data.bed = legacyOptional(raw.bed, (entry) => ({
+    ...legacySpot(entry),
+    at: finiteNumber(record(entry, 'bed').at, 'bed.at'),
+  }));
+  const portals = legacyList(raw.portals, MAX_LIST, (entry) => {
+    const r = record(entry, 'portal');
+    return {
+      a: legacySpot(r.a),
+      b: legacySpot(r.b),
+      at: finiteNumber(r.at, 'portal.at'),
+    };
+  });
+  if (Array.isArray(raw.portals)) data.portals = portals;
+  data.last = legacyOptional(raw.last, (entry) => {
+    const r = record(entry, 'last');
+    return {
+      ...legacySpot(r),
+      at: finiteNumber(r.at, 'last.at'),
+      ...(typeof r.doing === 'string' ? { doing: r.doing } : {}),
+      ...(typeof r.inventory === 'string' ? { inventory: r.inventory } : {}),
+    };
+  });
+
+  if (raw.activePlan !== undefined) {
+    try {
+      assertBoundedPlan(raw.activePlan);
+      data.activePlan = migratePlan(raw.activePlan);
+    } catch {
+      // Keep the legacy journal usable even if its optional new plan is damaged.
+    }
+  } else if (raw.version === 1 && typeof data.goal === 'string' && data.goal.trim()) {
+    try {
+      data.activePlan = migratePlan(data.goal);
+    } catch {
+      // The original text goal remains available even if it cannot be structured.
+    }
+  }
+  if (raw.planMode === 'shadow' || raw.planMode === 'active') data.planMode = raw.planMode;
+  if (Array.isArray(raw.planReceipts)) {
+    const receipts: MinecraftPlanReceipt[] = [];
+    for (const entry of raw.planReceipts.slice(-32)) {
+      try {
+        const r = record(entry, 'planReceipt');
+        const status = text(r.status, 'planReceipt.status');
+        if (status !== 'active' && status !== 'done' && status !== 'blocked') continue;
+        const definitionHash = text(r.definitionHash, 'planReceipt.definitionHash');
+        if (!/^[a-f0-9]{64}$/.test(definitionHash)) continue;
+        receipts.push({
+          id: text(r.id, 'planReceipt.id'),
+          definitionHash,
+          status,
+          updatedAt: finiteNumber(r.updatedAt, 'planReceipt.updatedAt'),
+        });
+      } catch {
+        // A damaged old receipt must not make the world journal unusable.
+      }
+    }
+    data.planReceipts = receipts;
+  }
+  if (raw.activeJob !== undefined) {
+    try {
+      data.activeJob = parseBuildJob(raw.activeJob);
+    } catch {
+      // Never resume from malformed content, a bad hash, or an oversized ledger.
+    }
+  }
+  return data;
+}
+
 export class WorldJournal {
   private constructor(readonly file: string, private data: JournalData) {}
 
   /** 打开（没有就新开一本）。seed 对不上：旧的改名留着，开新的；note 说明发生了什么 */
   static open(dir: string, server: string, username: string, seed?: string | null): { journal: WorldJournal; note?: string } {
     const file = journalFile(dir, server, username);
-    const fresh = (): JournalData => ({ version: 1, server, username, ...(seed ? { seed } : {}), sessions: 0, designs: [], buildings: [], fields: [], places: [], deaths: [], deathCount: 0 });
-    let data: JournalData | null = null;
+    let raw: Record<string, unknown> | null = null;
     try {
-      data = JSON.parse(fs.readFileSync(file, 'utf8')) as JournalData;
+      const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (isRecord(parsed)) raw = parsed;
     } catch {
-      data = null;
+      raw = null;
     }
     let note: string | undefined;
-    if (data && seed && data.seed && data.seed !== seed) {
+    if (raw && seed && typeof raw.seed === 'string' && raw.seed && raw.seed !== seed) {
       setAside(file, 'old-world');
       note = '这个服务器换了一个新世界（种子变了），上一个世界的日志收起来了，这本从头记。';
-      data = null;
+      raw = null;
     }
-    const journal = new WorldJournal(file, data ? { ...fresh(), ...data, ...(seed ? { seed } : {}) } : fresh());
+    const data = raw ? migrateJournal(raw, server, username, seed) : freshData(server, username, seed);
+    const journal = new WorldJournal(file, data);
     return { journal, note };
   }
 
@@ -120,6 +591,31 @@ export class WorldJournal {
     return this.data.designs;
   }
 
+  /** A defensive snapshot: mutating it cannot bypass validation or persistence. */
+  get activePlan(): MinecraftPlan | undefined {
+    return this.data.activePlan ? snapshot(this.data.activePlan) : undefined;
+  }
+
+  /** A defensive snapshot suitable for constructing a fresh world-diff build request. */
+  get activeJob(): MinecraftBuildJob | undefined {
+    return this.data.activeJob ? snapshot(this.data.activeJob) : undefined;
+  }
+
+  get planMode(): MinecraftPlanMode {
+    return this.data.planMode ?? 'active';
+  }
+
+  planReceipt(id: string): MinecraftPlanReceipt | undefined {
+    const receipt = this.data.planReceipts?.find((entry) => entry.id === id);
+    return receipt ? { ...receipt } : undefined;
+  }
+
+  setPlanMode(mode: MinecraftPlanMode): void {
+    if (mode !== 'shadow' && mode !== 'active') throw new TypeError('invalid plan mode');
+    this.data.planMode = mode;
+    this.save();
+  }
+
   startSession(): void {
     this.data.sessions += 1;
     this.save();
@@ -128,6 +624,105 @@ export class WorldJournal {
   setGoal(goal: string): void {
     this.data.goal = goal;
     this.save();
+  }
+
+  /** Accept a current plan, structured draft, text goal, or legacy journal goal. */
+  setPlan(payload: unknown, options: PlanIdAndTime = {}): MinecraftPlan {
+    assertBoundedPlan(payload);
+    const plan = migratePlan(payload, options);
+    assertBoundedPlan(plan);
+    this.data.activePlan = plan;
+    const receipt: MinecraftPlanReceipt = {
+      id: plan.id,
+      definitionHash: planDefinitionHash(plan),
+      status: plan.status,
+      updatedAt: plan.updatedAt,
+    };
+    const receipts = (this.data.planReceipts ?? []).filter((entry) => entry.id !== plan.id);
+    receipts.push(receipt);
+    this.data.planReceipts = receipts.slice(-32);
+    this.save();
+    return snapshot(plan);
+  }
+
+  /** Create the single resumable job. Existing jobs require explicit completion/abandon first. */
+  createJob(input: MinecraftBuildJobInput): MinecraftBuildJob {
+    if (this.data.activeJob) throw new Error(`build job ${this.data.activeJob.id} is still active`);
+    record(input, 'job');
+    const now = timestamp(input.now ?? Date.now(), 'job.now');
+    const blocks = canonicalBlocks(input.blocks);
+    const clear = canonicalClear(input.clear);
+    const dimension = text(input.dimension, 'job.dimension');
+    const planId = optionalId(input.planId, 'job.planId');
+    const stepId = optionalId(input.stepId, 'job.stepId');
+    const interruptionReason = input.interruptionReason === undefined
+      ? undefined
+      : text(input.interruptionReason, 'job.interruptionReason');
+    const raw = {
+      id: input.id ?? randomUUID(),
+      ...(planId === undefined ? {} : { planId }),
+      ...(stepId === undefined ? {} : { stepId }),
+      label: input.label,
+      dimension,
+      blocks,
+      clear,
+      contentHash: buildContentHash(dimension, blocks, clear),
+      ...(input.origin === undefined ? {} : { origin: blockPosition(input.origin, 'job.origin') }),
+      phase: input.phase ?? 'SECURING',
+      ...(interruptionReason === undefined ? {} : { interruptionReason }),
+      ownedTemporary: input.ownedTemporary ?? [],
+      attempts: input.attempts ?? 0,
+      maxAttempts: input.maxAttempts ?? 3,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const job = parseBuildJob(raw);
+    this.data.activeJob = job;
+    this.save();
+    return snapshot(job);
+  }
+
+  /** Update recovery state and evidence only; canonical content and its hash are immutable. */
+  updateJob(id: string, update: MinecraftBuildJobUpdate): MinecraftBuildJob {
+    const current = this.data.activeJob;
+    if (!current || current.id !== id) throw new Error(`unknown active build job ${id}`);
+    const now = timestamp(update.now ?? Date.now(), 'job.now');
+    if (now < current.updatedAt) throw new RangeError('job.now must not move updatedAt backwards');
+    const attempts = update.attempts ?? current.attempts;
+    if (!Number.isSafeInteger(attempts) || attempts < current.attempts) {
+      throw new RangeError('job.attempts must be a nondecreasing safe integer');
+    }
+    const interruptionReason = update.interruptionReason === null
+      ? undefined
+      : update.interruptionReason === undefined
+        ? current.interruptionReason
+        : text(update.interruptionReason, 'job.interruptionReason');
+    const raw: MinecraftBuildJob = {
+      ...current,
+      phase: update.phase ?? current.phase,
+      ...(interruptionReason === undefined ? {} : { interruptionReason }),
+      ownedTemporary: update.ownedTemporary === undefined
+        ? current.ownedTemporary
+        : canonicalTemporary(update.ownedTemporary),
+      attempts,
+      maxAttempts: update.maxAttempts ?? current.maxAttempts,
+      updatedAt: now,
+    };
+    // Spread above can retain interruptionReason when null was requested; remove it explicitly.
+    if (update.interruptionReason === null) delete raw.interruptionReason;
+    const job = parseBuildJob(raw);
+    this.data.activeJob = job;
+    this.save();
+    return snapshot(job);
+  }
+
+  /** Normal stops call updateJob instead. Only these two explicit outcomes remove recovery state. */
+  clearJob(id: string, outcome: 'DONE' | 'ABANDONED'): boolean {
+    if (outcome !== 'DONE' && outcome !== 'ABANDONED') throw new TypeError('clearJob requires DONE or ABANDONED');
+    if (!this.data.activeJob || this.data.activeJob.id !== id) return false;
+    delete this.data.activeJob;
+    this.save();
+    return true;
   }
 
   saveDesign(name: string, text: string): void {

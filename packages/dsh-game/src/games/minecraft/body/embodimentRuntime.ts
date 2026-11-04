@@ -41,12 +41,12 @@ export class MinecraftEmbodimentRuntime {
     this.active = { id: instruction.id, abort };
     const started = this.now();
     try {
-      return await handler.run(instruction, {
+      return withCertainty(await handler.run(instruction, {
         adapter: this.options.adapter,
         signal: abort.signal,
         now: this.now,
         snapshot: () => this.snapshot(),
-      });
+      }));
     } catch (error) {
       const interruption = this.active?.id === instruction.id
         ? this.active.interruption
@@ -94,12 +94,12 @@ export class MinecraftEmbodimentRuntime {
     }
     const started = this.now();
     try {
-      return await handler.run(instruction, {
+      return withCertainty(await handler.run(instruction, {
         adapter: this.options.adapter,
         signal: new AbortController().signal,
         now: this.now,
         snapshot: () => this.snapshot(),
-      });
+      }));
     } catch (error) {
       return failure(instruction.id, instruction.name, 'adapter_error', true, started, { message: error instanceof Error ? error.message : String(error) });
     }
@@ -115,6 +115,19 @@ export class MinecraftEmbodimentRuntime {
     await this.options.adapter.stopNavigation();
     return true;
   }
+}
+
+const UNCERTAIN_RESULT_CODES = new Set<MinecraftActionErrorCode>([
+  'timeout', 'unknown', 'adapter_error', 'inventory_desync', 'died', 'cancelled',
+]);
+
+/** Older action helpers stay source-compatible; the runtime adds one conservative envelope. */
+export function withCertainty(result: MinecraftActionResult): MinecraftActionResult {
+  return {
+    ...result,
+    certainty: result.certainty
+      ?? (UNCERTAIN_RESULT_CODES.has(result.error?.code as MinecraftActionErrorCode) ? 'uncertain' : 'certain'),
+  };
 }
 
 export interface MinecraftActionInterruption {
@@ -136,6 +149,7 @@ function failure(
   return {
     actionId,
     outcome: 'failed',
+    certainty: UNCERTAIN_RESULT_CODES.has(code) ? 'uncertain' : 'certain',
     summary: summary ?? `${actionName} failed: ${code}`,
     durationMs: Math.max(0, Date.now() - started),
     inventoryDelta: {},

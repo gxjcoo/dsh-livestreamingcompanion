@@ -31,6 +31,20 @@ export function createProductionActions(): MinecraftActionHandler[] {
       },
     },
     {
+      name: 'ensure_lighting',
+      async run(instruction, context) {
+        const result = await context.adapter.ensureLighting({
+          radius: numberArg(instruction.args.radius, 6, 1, 10),
+          verticalRadius: numberArg(instruction.args.verticalRadius, 2, 0, 4),
+          maxTorches: numberArg(instruction.args.maxTorches, 4, 1, 8),
+          policy: instruction.args.policy === 'spawn-risk' ? 'spawn-risk' : 'visibility',
+          protectedCells: positionsArg(instruction.args.protectedCells),
+          signal: context.signal,
+        });
+        return { ...result, actionId: instruction.id };
+      },
+    },
+    {
       name: 'build_structure',
       async run(instruction, context) {
         const blocks = Array.isArray(instruction.args.blocks) ? instruction.args.blocks as any[] : [];
@@ -40,6 +54,7 @@ export function createProductionActions(): MinecraftActionHandler[] {
           label: typeof instruction.args.label === 'string' ? instruction.args.label : 'the building',
           blocks,
           clear,
+          ownedTemporary: temporaryBlocksArg(instruction.args.ownedTemporary),
           signal: context.signal,
         });
         return { ...result, actionId: instruction.id };
@@ -161,4 +176,18 @@ function positionArg(value: unknown): { x: number; y: number; z: number } | unde
   const y = Number(record.y);
   const z = Number(record.z);
   return Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z) ? { x, y, z } : undefined;
+}
+
+function positionsArg(value: unknown): { x: number; y: number; z: number }[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(positionArg).filter((position): position is { x: number; y: number; z: number } => Boolean(position));
+}
+
+function temporaryBlocksArg(value: unknown): { x: number; y: number; z: number; name: string }[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.flatMap((entry) => {
+    const position = positionArg(entry);
+    const name = entry && typeof entry === 'object' && typeof (entry as any).name === 'string' ? (entry as any).name : '';
+    return position && name ? [{ ...position, name }] : [];
+  });
 }

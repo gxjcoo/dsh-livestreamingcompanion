@@ -27,7 +27,27 @@ import { BlockColors, VIEW_LABELS, renderBlueprint } from './preview.js';
 import { describeTerrain, findFlatSpots, renderTerrain } from './terrainMap.js';
 import type { TerrainScan } from './body/terrain.js';
 import { GameJar } from './gameJar.js';
-import { WorldJournal, dimensionName } from './journal.js';
+import { WorldJournal, buildRequestHash, dimensionName, planDefinitionHash, type MinecraftBuildJob, type MinecraftBuildPhase, type MinecraftPlanMode } from './journal.js';
+import {
+  beginStep,
+  canonicalJson,
+  completeStep,
+  evaluateCompletion,
+  failRecovery,
+  failStep,
+  markRecoveryStarted,
+  migratePlan,
+  resetRecoveryStarted,
+  type BlockLightObservation,
+  type CompletionObservation,
+  type FailureDisposition,
+  type JsonObject,
+  type JsonValue,
+  type MinecraftPlan,
+  type PlanStep,
+} from './plan.js';
+import { planFailureRecovery, planSkill, type SkillAction } from './skills.js';
+import { needsLighting, type MinecraftLightingPolicy } from './body/lighting.js';
 
 export interface MinecraftOptions {
   /** 打包好的身体子进程（lib/minecraft-worker.cjs） */
@@ -67,8 +87,35 @@ type JournalMeta =
   | { kind: 'farm'; crop: string; corner: { x: number; y: number; z: number }; size: number }
   | { kind: 'sleep' };
 
+type PlanRecovery = 'supply' | 'defence' | 'reroute';
+
+interface PlanActionRef {
+  planId: string;
+  stepId: string;
+  attempt: number;
+  idempotent: boolean;
+  role: 'skill' | 'recovery';
+  recovery?: PlanRecovery;
+  /** Canonical body action + args, used only to detect a no-progress repeat. */
+  actionKey: string;
+}
+
+interface LightingMaintenanceRef {
+  kind: 'lighting';
+  key: string;
+  attempt: number;
+}
+
+interface LightingMaintenanceState {
+  attempts: number;
+  nextAt: number;
+  exhaustionNotified: boolean;
+}
+
 /** 身体在后台做的一件事 */
 interface Running {
+  /** Stable across a collect fallback which re-dispatches with a new body action ID. */
+  runId: string;
   id: string;
   /** 给她看的说法：「采集 oak_log ×8」 */
   label: string;
@@ -82,6 +129,27 @@ interface Running {
   /** 交给身体的动作和参数（被自保的事打断以后接着做用） */
   bodyAction?: string;
   args?: Record<string, unknown>;
+  /** 生存建造对应的持久 job；结果只更新这个 ID，绝不按显示文字匹配 */
+  jobId?: string;
+  plan?: PlanActionRef;
+  maintenance?: LightingMaintenanceRef;
+  /** 动作开始时的真实状态，用来识别“成功返回但毫无进展”。 */
+  progressSignature?: string;
+}
+
+interface QueuedAction {
+  bodyAction: string;
+  args: Record<string, unknown>;
+  label: string;
+  meta?: JournalMeta;
+  jobId?: string;
+  plan?: PlanActionRef;
+  maintenance?: LightingMaintenanceRef;
+}
+
+interface Settlement {
+  promise: Promise<void>;
+  done(): void;
 }
 
 /** 自保的事：不排队，先停下手上的 */
@@ -97,6 +165,7 @@ const IDLE_MAX_MS = 120_000;
 
 const ACTIONS: GameActionSpec[] = [
   { action: 'goal', description: '写下 / 改掉你的长期目标（比如「打败末影龙」「盖一个小木屋」），之后每个时刻都会提醒你', params: { text: '目标' } },
+  { action: 'plan', description: '设置会自动推进的结构化计划；data={id,mode:"active"|"shadow",goal,steps:[{id?,skill,args,completion,dependsOn?,maxAttempts?,maxNoProgressAttempts?}]}。skill 可用 ensure_torches/ensure_lighting/ensure_tool/equip_best_loadout/secure_build_site/build_resume/recover_after_death/ensure_food/prepare_for_night；completion 用真实谓词 inventory_at_least、block_light_at_least、near_position、blueprint_complete 或 all_of。相同 id+内容重复提交是幂等回执，active 自动执行，shadow 只验证和报告', params: { data: '计划草稿；id 作为持久交接 ID，换计划必须换新 id，不能靠自然语言汇报完成' } },
   { action: 'collect', description: '采集一种东西：自己找、走过去、挖、捡起来，直到背包里多了这么多（后台做）。各种原木（oak_log、spruce_log……）算同一种，砍的是最近的树；木板、木棍、工作台用哪种木头都行', params:{ name: '物品的英文 id，比如 oak_log、cobblestone、iron_ore', index: '数量（默认 1）' } },
   { action: 'craft', description: '合成（需要工作台的会自己找或放一个；缺的中间材料会先合成）（后台做）', params: { name: '物品的英文 id，比如 crafting_table、wooden_pickaxe、torch', index: '数量（默认 1）' } },
   { action: 'smelt', description: '用熔炉烧东西（后台做）', params: { name: '要得到的东西的英文 id，比如 iron_ingot、cooked_beef', index: '数量（默认 1）' } },
@@ -129,7 +198,8 @@ const ACTIONS: GameActionSpec[] = [
   { action: 'mark', description: '在这个世界的日志里记一个地点（家、矿洞、村庄……），下次来还能找到；同名的会换成新位置', params: { name: '地点的名字', text: '坐标「x y z」（不填就是你现在站的地方）；填「删掉」就把这个地点从日志里删了' } },
   { action: 'journal', description: '看这个世界的整本日志（目标、地点、盖过的房子、种过的地、床、死过的地方、图纸）' },
   { action: 'chat', description: '在游戏的聊天栏里打字（游戏里的玩家才看得到；你回复里写的话是说出口的，不会进游戏聊天）', params: { text: '要发的话' } },
-  { action: 'stop', description: '停下正在做的事' },
+  { action: 'stop', description: '暂停正在做的事并清空排队；未完成的施工会保留，之后可按真实差量续建' },
+  { action: 'abandon', description: '明确放弃当前施工任务：停止动作、撤掉虚影并删除恢复记录（不是暂停）' },
 ];
 
 /** 虚影最多放这么多块（每块是一个实体，太多了服务器和看的人都卡） */
@@ -167,13 +237,31 @@ export class MinecraftSession implements GameSession {
   private status: MinecraftStatus | null = null;
   private snapshot: MinecraftEnvironmentSnapshot | null = null;
   private seq = 0;
+  private lastMoment: Moment | null = null;
   private lines: string[] = [];
   private urgent = false;
   private wake: (() => void) | null = null;
   private running: Running | null = null;
   /** 排着队等身体做的长动作（她一次下了好几个，按顺序做） */
-  private queue: { bodyAction: string; args: Record<string, unknown>; label: string; meta?: JournalMeta }[] = [];
+  private queue: QueuedAction[] = [];
+  /** execute-action 的 response 不是清理结束；按 action ID 等原 handler 的 settled 屏障 */
+  private readonly settlements = new Map<string, Settlement>();
+  /** 死亡 / 敌人打断后的最早续作时间，避免在复活点或怪群里立刻重放 */
+  private recoveryAt = 0;
   private goal = '';
+  private plan: MinecraftPlan | null = null;
+  private planMode: MinecraftPlanMode = 'active';
+  private readonly memoryPlanReceipts = new Map<string, { definitionHash: string; status: MinecraftPlan['status'] }>();
+  private pumpingPlan = false;
+  /** 每个计划步骤本次 attempt 的身体动作数，防止一直“有进展”却永远不验收。 */
+  private readonly planActionCounts = new Map<string, number>();
+  /** 最近一次当前步骤的真实图纸差量；没有证据时保持 unknown。 */
+  private readonly blueprintEvidence = new Map<string, { remaining: number; unloaded: number }>();
+  /** 当前步骤最近一次有界照明扫描；key 含目标坐标，绝不借用身体当前位置的样本。 */
+  private readonly lightingEvidence = new Map<string, BlockLightObservation>();
+  /** 真实亮度驱动的低优先级照明维护；按维度/位置/冷却去重并有失败预算。 */
+  private readonly lightingMaintenance = new Map<string, LightingMaintenanceState>();
+  private lightingPosition: { key: string; since: number } | null = null;
   /** 她什么时候写下的目标（上一局留下的是 null）：目标是她的原话，里面写的进度会过时，标上时间 */
   private goalAt: number | null = null;
   private players = new Set<string>();
@@ -299,7 +387,7 @@ export class MinecraftSession implements GameSession {
     }
     this.disconnected = false;
     // 上一局（DSH 被关掉时）可能留着虚影
-    if (this.options.rcon) void GhostBuild.clearAll(this.options.rcon);
+    if (this.options.rcon) await GhostBuild.clearAll(this.options.rcon);
     // 上一局的导播实体
     if (this.options.rcon) void rcon(this.options.rcon, 'kill @e[type=item_display,tag=dsh_cam]').catch(() => {});
     // 生存 / 创造：按开局设置切过去（上一局可能是另一个模式）
@@ -310,12 +398,18 @@ export class MinecraftSession implements GameSession {
     await this.refresh();
     this.lastHealth = this.snapshot?.body?.health ?? null;
     this.lastPhase = phaseOf(this.snapshot?.world?.timeOfDay);
-    this.poller = setInterval(() => void this.poll().catch(() => {}), POLL_MS);
     const world = await this.openJournal();
+    this.restorePersistedPlan();
+    this.restorePersistedWork();
+    this.pumpQueue();
+    this.poller = setInterval(() => void this.poll().catch(() => {}), POLL_MS);
     return [this.describeNow(`进了服务器 ${this.options.host}:${this.options.port}（Minecraft ${this.status?.version ?? '版本不明'}，有哪些方块、物品和配方按这个版本来）`), world].filter(Boolean).join('\n');
   }
 
-  async wait(signal: AbortSignal, maxMs: number): Promise<Moment> {
+  async wait(signal: AbortSignal, maxMs: number, after = 0): Promise<Moment> {
+    const acknowledged = Number.isSafeInteger(after) ? Math.max(0, Math.min(after, this.seq)) : this.seq;
+    // 重复 / 乱序的 after 重放最近一个已交付时刻，不制造新编号，也不重复消费事件。
+    if (acknowledged < this.seq && this.lastMoment) return this.lastMoment;
     const limit = Math.min(maxMs, IDLE_MAX_MS);
     const deadline = Date.now() + limit;
     while (!this.urgent && !this.lines.length && !this.nudged && !this.disconnected && !signal.aborted && Date.now() < deadline) {
@@ -372,8 +466,10 @@ export class MinecraftSession implements GameSession {
     }
     // 去做别的事了：摄像机回到她身上（飞到草稿附近看它不算：离草稿 64 格以内的 go 摄像机接着拍草稿）
     const nearDraft = action.action === 'go' && !!xyz && !!this.director && Math.hypot(xyz.x - this.director.center.x, xyz.z - this.director.center.z) <= 64;
-    if (!nearDraft && !['design', 'template', 'view', 'site', 'build', 'show', 'look', 'journal', 'mark', 'goal', 'chat'].includes(action.action)) this.stopDirecting();
+    if (!nearDraft && !['design', 'template', 'view', 'site', 'build', 'show', 'look', 'journal', 'mark', 'goal', 'plan', 'chat'].includes(action.action)) this.stopDirecting();
     switch (action.action) {
+      case 'plan':
+        return this.acceptPlan(action.data);
       case 'goal':
         this.goal = action.text!.trim();
         this.goalAt = Date.now();
@@ -465,13 +561,32 @@ export class MinecraftSession implements GameSession {
         return '发到游戏聊天栏了。';
       case 'stop': {
         const was = this.running;
+        this.pausePlan('主人或 Agent 暂停了计划；恢复前必须重新验收。');
         const dropped = this.queue.length;
         this.queue = [];
-        this.running = null;
-        was?.abort?.abort();
-        await runtime.command('stop', {});
+        const job = this.journal?.activeJob;
+        if (job) this.journal?.updateJob(job.id, { phase: 'RECOVERING', interruptionReason: '主人或 Agent 暂停了当前工作。' });
+        await this.replaceRunning();
+        // 暂停不清施工虚影；同会话还能看清未完成的图纸。完全关闭会话时才清显示实体。
+        if (!job) await this.clearGhosts();
+        return was ? `停下了（原来在${was.label}${dropped ? `，排着的 ${dropped} 件也取消了` : ''}）。${job ? '施工任务已保留，之后可续建。' : ''}` : job ? '当前没有动作；未完成的施工仍保留。' : '本来就没在做什么。';
+      }
+      case 'abandon': {
+        const was = this.running;
+        this.queue = [];
+        const job = this.journal?.activeJob;
+        await this.replaceRunning();
+        if (job?.planId && this.plan?.id === job.planId) {
+          const step = this.plan.steps.find((candidate) => candidate.id === job.stepId && candidate.status === 'running');
+          if (step) this.commitPlan(failStep(this.plan, step.id, {
+            now: Math.max(Date.now(), this.plan.updatedAt), code: 'abandoned',
+            message: '施工已被明确放弃，需要新计划。', disposition: 'replan', certainty: 'certain',
+            idempotent: true, progress: this.realProgress(step),
+          }));
+        }
+        if (job) this.journal?.clearJob(job.id, 'ABANDONED');
         await this.clearGhosts();
-        return was ? `停下了（原来在${was.label}${dropped ? `，排着的 ${dropped} 件也取消了` : ''}）。` : '本来就没在做什么。';
+        return job ? `已放弃施工「${job.label}」，恢复记录和虚影已清除。` : was ? `停下了${was.label}；没有施工恢复记录需要放弃。` : '没有未完成的施工任务。';
       }
       case 'find': {
         // 每一处的坐标和距离（近的在前）：她接着 go 或者 dig 要用
@@ -496,32 +611,26 @@ export class MinecraftSession implements GameSession {
       }
       case 'follow': {
         this.queue = [];
+        this.interruptPlan('跟随玩家替换了当前计划动作。');
         await this.replaceRunning();
         const r = await this.body('follow_player', { player: action.name!.trim() }, 30_000);
-        if (r.outcome === 'succeeded') this.running = { id: r.actionId, label: `跟着 ${action.name!.trim()} 走`, startedAt: Date.now(), inventory: {} };
+        if (r.outcome === 'succeeded') {
+          const label = `跟着 ${action.name!.trim()} 走`;
+          this.running = {
+            runId: r.actionId, id: r.actionId, label, startedAt: Date.now(), inventory: {},
+            bodyAction: 'follow_player', args: { player: action.name!.trim() },
+          };
+          this.options.record({
+            type: 'minecraft_action', phase: 'started', runId: r.actionId, actionId: r.actionId,
+            action: 'follow_player', label,
+          });
+        }
         return describeResult(r, `跟着 ${action.name!.trim()}`);
       }
       default:
         break;
     }
     if (!LONG.has(action.action)) return `没有这个动作：${action.action}`;
-    // 盖房子：先在那个位置放出虚影（有 RCON 时），排着队的也先放
-    if (action.action === 'build' && this.options.rcon) {
-      const title = action.name!.trim();
-      const label = `盖「${title}」`;
-      const site = this.sites.get(title);
-      if (site) {
-        await site.ghost?.clear();
-        this.sites.delete(title);
-      }
-      this.directAt(this.designs.get(title)!, xyz!);
-      await this.ghosts.get(label)?.clear();
-      const ghost = new GhostBuild(this.options.rcon, `b${++this.ghostSeq}`, this.options.log);
-      this.ghosts.set(label, ghost);
-      const cells = ghostCells(this.designs.get(title)!, xyz!);
-      // 很大的建筑虚影太多（每块是一个实体）：只在不太多时放
-      if (cells.length <= GHOST_MAX) await ghost.show(cells);
-    }
     const meta: JournalMeta | undefined = action.action === 'build' ? { kind: 'build', name: action.name!.trim(), origin: xyz! }
       : action.action === 'farm' ? { kind: 'farm', crop: name, corner: xyz!, size: Math.max(1, Math.min(9, Math.round(action.index ?? 3))) }
         : action.action === 'sleep' ? { kind: 'sleep' } : undefined;
@@ -556,23 +665,258 @@ export class MinecraftSession implements GameSession {
         default: return ['pickup_drops', { radius: 12 }, '捡附近的掉落物'];
       }
     })();
+    let jobId: string | undefined;
+    if (bodyAction === 'build_structure') {
+      const prepared = this.prepareBuildJob(label, args, meta);
+      if (prepared.error) return prepared.error;
+      jobId = prepared.jobId;
+      if (jobId && (this.running?.jobId === jobId || this.queue.some((item) => item.jobId === jobId))) {
+        return `「${label}」已经是当前施工任务，不会重复排队；中断后会按真实世界差量续建。`;
+      }
+    }
+    // 持久 job 建立成功后才放虚影，避免被拒绝的新图纸留下误导性的现场标记。
+    if (action.action === 'build' && this.options.rcon) {
+      const title = action.name!.trim();
+      const site = this.sites.get(title);
+      if (site) {
+        await site.ghost?.clear();
+        this.sites.delete(title);
+      }
+      this.directAt(this.designs.get(title)!, xyz!);
+      await this.ghosts.get(label)?.clear();
+      const ghost = new GhostBuild(this.options.rcon, `b${++this.ghostSeq}`, this.options.log);
+      this.ghosts.set(label, ghost);
+      const cells = ghostCells(this.designs.get(title)!, xyz!);
+      if (cells.length <= GHOST_MAX) await ghost.show(cells);
+    }
     // 打怪、逃跑、躲起来不排队：先停下手上的事，自保完再接着做（能接着做的）
     if (this.running && URGENT.has(action.action)) {
       const was = this.running;
       await this.refresh().catch(() => {});
       const again = this.resumeOf(was);
+      this.interruptPlan(`紧急动作 ${action.action} 替换了当前计划动作。`);
       await this.replaceRunning();
       if (again) this.queue.unshift(again);
-      this.begin(bodyAction, args, label, meta);
+      this.begin(bodyAction, args, label, meta, jobId);
       const after = again ? `；做完接着${again.label}` : was.abort ? '' : `（${was.label}没有接着做：再做一遍会多做一份，要的话做完再下）`;
       return `先停下${was.label}，开始${label}${after}。做完或卡住了会在下一个时刻告诉你。`;
     }
     if (this.running) {
-      this.queue.push({ bodyAction, args, label, meta });
+      this.queue.push({ bodyAction, args, label, meta, jobId });
       return `身体正在${this.running.label}，「${label}」排上了（前面还有 ${this.queue.length} 件，包括正在做的）。`;
     }
-    this.begin(bodyAction, args, label, meta);
+    this.begin(bodyAction, args, label, meta, jobId);
     return `开始${label}。做完或卡住了会在下一个时刻告诉你。`;
+  }
+
+  /** 严格接收计划草稿；执行状态只能由 session 根据真实证据推进，Agent 不能直接提交 done/running。 */
+  private async acceptPlan(data: Record<string, unknown> | undefined): Promise<string> {
+    if (!data) return 'plan 需要在 data 里填结构化计划草稿。';
+    const { mode = 'active', handoffId, ...draft } = data;
+    if (mode !== 'active' && mode !== 'shadow') return 'plan 的 mode 只能是 active 或 shadow。';
+    if (handoffId !== undefined && (typeof handoffId !== 'string' || !handoffId.trim())) return 'handoffId 必须是非空字符串。';
+    if (draft.id !== undefined && (typeof draft.id !== 'string' || !draft.id.trim())) return 'id 必须是非空字符串。';
+    if (draft.version !== undefined) return 'plan 只接受 goal+steps 草稿，不能直接提交带执行状态的 version 计划。';
+    if (handoffId !== undefined && draft.id !== undefined && draft.id !== handoffId) return 'id 和 handoffId 不一致。';
+    try {
+      const candidate = migratePlan(draft, { id: (handoffId ?? draft.id) as string | undefined });
+      const definitionHash = planDefinitionHash(candidate);
+      const receipt = this.journal?.planReceipt(candidate.id) ?? this.memoryPlanReceipts.get(candidate.id);
+      if (receipt) {
+        if (receipt.definitionHash !== definitionHash) return `交接 ${candidate.id} 已经用于另一份计划；换内容必须使用新 ID。`;
+        if (this.plan?.id === candidate.id) {
+          if (mode === 'shadow' && this.running?.plan) {
+            this.pausePlan('切换到 shadow，先停妥当前计划动作。');
+            await this.replaceRunning();
+          }
+          this.setPlanMode(mode);
+          this.pumpQueue();
+          return `交接 ${candidate.id} 已接收（${receipt.status}），不会重复创建；模式：${mode}。`;
+        }
+        return `交接 ${candidate.id} 已接收（${receipt.status}），不会重复执行或替换当前计划。`;
+      }
+      if (this.plan?.id === candidate.id) {
+        if (planDefinitionHash(this.plan) !== definitionHash) return `计划 ${candidate.id} 内容变了；修订计划请使用新 ID。`;
+        if (mode === 'shadow' && this.running?.plan) {
+          this.pausePlan('切换到 shadow，先停妥当前计划动作。');
+          await this.replaceRunning();
+        }
+        this.setPlanMode(mode);
+        this.pumpQueue();
+        return `计划 ${candidate.id} 已经存在，不会重复创建；模式：${mode}。`;
+      }
+      const job = this.journal?.activeJob;
+      if (job?.planId && job.planId !== candidate.id) {
+        return `旧计划 ${job.planId} 还有未完成的施工「${job.label}」。先 abandon 明确放弃，再交接新计划。`;
+      }
+      // 显式换计划会取消旧计划动作，但不动 Agent 单独排下的非计划工作。
+      if (this.running?.plan) await this.replaceRunning();
+      this.queue = this.queue.filter((item) => !item.plan);
+      this.commitPlan(candidate);
+      this.setPlanMode(mode);
+      this.goal = candidate.goal;
+      this.goalAt = Date.now();
+      this.journal?.setGoal(candidate.goal);
+      this.planActionCounts.clear();
+      this.blueprintEvidence.clear();
+      this.lightingEvidence.clear();
+      this.push(`已接收计划 ${candidate.id}（${candidate.steps.length} 步，${mode === 'active' ? '自动执行' : '只观察真实状态'}）。`, true);
+      this.pumpQueue();
+      return `计划 ${candidate.id} 已接收：${candidate.goal}；${candidate.steps.length} 步，mode=${mode}。${mode === 'active' ? '会逐个执行有界动作，每步按真实谓词验收。' : 'shadow 模式不会下发计划动作。'}`;
+    } catch (error) {
+      return `计划校验失败：${(error as Error).message}`;
+    }
+  }
+
+  private commitPlan(plan: MinecraftPlan): void {
+    this.plan = this.journal?.setPlan(plan) ?? plan;
+    this.memoryPlanReceipts.set(this.plan.id, {
+      definitionHash: planDefinitionHash(this.plan), status: this.plan.status,
+    });
+    if (this.memoryPlanReceipts.size > 32) this.memoryPlanReceipts.delete(this.memoryPlanReceipts.keys().next().value!);
+    this.options.record({
+      type: 'minecraft_plan', planId: this.plan.id, revision: this.plan.revision, status: this.plan.status,
+      steps: this.plan.steps.map((step) => ({
+        id: step.id, skill: step.skill, status: step.status, attempts: step.attempts,
+        recoveryAttempts: step.recoveryAttempts ?? 0,
+        noProgressAttempts: step.noProgressAttempts, maxNoProgressAttempts: step.maxNoProgressAttempts,
+        failureCode: step.lastFailure?.code, failureFingerprint: step.lastFailure?.fingerprint,
+        disposition: step.lastFailure?.disposition,
+        certainty: step.lastFailure?.certainty,
+      })),
+    });
+  }
+
+  private setPlanMode(mode: MinecraftPlanMode): void {
+    this.journal?.setPlanMode(mode);
+    this.planMode = mode;
+    if (mode === 'shadow') this.lightingEvidence.clear();
+  }
+
+  private evidenceKey(planId: string, stepId: string, blueprintId: string): string {
+    return `${planId}/${stepId}/${blueprintId}`;
+  }
+
+  private rememberLightingEvidence(ref: PlanActionRef, result: MinecraftActionResult): void {
+    if (result.outcome !== 'succeeded') return;
+    const observation = result.observations.find((entry) => entry.kind === 'lighting-evidence');
+    const samples = observation?.data?.samples;
+    if (!Array.isArray(samples) || samples.length > 4096) return;
+    for (const value of samples) {
+      if (!value || typeof value !== 'object') continue;
+      const sample = value as Record<string, unknown>;
+      if (typeof sample.dimension !== 'string' || !sample.dimension
+        || !['x', 'y', 'z'].every((key) => Number.isSafeInteger(sample[key]))) continue;
+      const loaded = sample.loaded === true;
+      const blockLight = sample.blockLight;
+      if (loaded && (typeof blockLight !== 'number' || !Number.isFinite(blockLight) || blockLight < 0 || blockLight > 15)) continue;
+      const position = { x: Number(sample.x), y: Number(sample.y), z: Number(sample.z) };
+      const dimension = sample.dimension.replace(/^minecraft:/, '');
+      const key = `${dimension}:${position.x},${position.y},${position.z}`;
+      this.lightingEvidence.set(this.evidenceKey(ref.planId, ref.stepId, key), {
+        ...position, dimension, loaded, ...(loaded ? { blockLight: blockLight as number } : {}),
+      });
+    }
+  }
+
+  /** Only current body samples and action-produced world diffs are completion evidence. */
+  private completionObservation(step: PlanStep): CompletionObservation {
+    const s = this.snapshot;
+    if (!s || s.stale || this.disconnected) return {};
+    const observation: CompletionObservation = {};
+    if (s.body) {
+      observation.inventory = { ...s.body.inventory };
+      if (s.world?.dimension) observation.position = { ...s.body.position, dimension: this.dimension() };
+      const light = s.lighting;
+      if (s.world?.dimension && light?.loaded && typeof light.blockLight === 'number') {
+        observation.blockLight = [{
+          x: Math.floor(s.body.position.x), y: Math.floor(s.body.position.y), z: Math.floor(s.body.position.z),
+          dimension: this.dimension(), loaded: true, blockLight: light.blockLight,
+        }];
+      }
+    }
+    if (this.plan) {
+      const prefix = `${this.plan.id}/${step.id}/`;
+      for (const [key, value] of this.lightingEvidence) {
+        if (key.startsWith(prefix)) (observation.blockLight ??= []).push({ ...value });
+      }
+      for (const [key, value] of this.blueprintEvidence) {
+        if (!key.startsWith(prefix)) continue;
+        (observation.blueprints ??= {})[key.slice(prefix.length)] = { ...value };
+      }
+    }
+    return observation;
+  }
+
+  private realProgress(step?: PlanStep): JsonValue {
+    const s = this.snapshot;
+    const progress: Record<string, JsonValue> = {
+      inventory: s && !s.stale ? { ...(s.body?.inventory ?? {}) } : 'unknown',
+      position: s?.body && s.world?.dimension && !s.stale
+        ? { ...s.body.position, dimension: this.dimension() } : 'unknown',
+      light: s?.lighting && !s.stale ? {
+        loaded: s.lighting.loaded,
+        blockLight: s.lighting.blockLight,
+        skyLight: s.lighting.skyLight,
+      } : 'unknown',
+    };
+    if (step && this.plan) {
+      const prefix = `${this.plan.id}/${step.id}/`;
+      const builds: Record<string, JsonValue> = {};
+      for (const [key, value] of this.blueprintEvidence) {
+        if (key.startsWith(prefix)) builds[key.slice(prefix.length)] = { ...value };
+      }
+      progress.blueprints = builds;
+      const scannedLighting: Record<string, JsonValue> = {};
+      for (const [key, value] of this.lightingEvidence) {
+        if (key.startsWith(prefix)) scannedLighting[key.slice(prefix.length)] = value.loaded ? value.blockLight ?? 'unknown' : 'unloaded';
+      }
+      progress.scannedLighting = scannedLighting;
+    }
+    return progress;
+  }
+
+  /** 新建或接上唯一的持久施工 job；保存的是规范化图纸，不是模型口述的进度。 */
+  private prepareBuildJob(
+    label: string,
+    args: Record<string, unknown>,
+    meta?: JournalMeta,
+    plan?: PlanActionRef,
+  ): { jobId?: string; error?: string } {
+    if (!this.journal) return {};
+    if (meta?.kind !== 'build') return { error: '施工任务缺少图纸来源，不能建立恢复记录。' };
+    try {
+      const dimension = this.dimension();
+      const blocks = args.blocks as MinecraftBuildJob['blocks'];
+      const clear = args.clear as MinecraftBuildJob['clear'];
+      const contentHash = buildRequestHash(dimension, blocks, clear);
+      const existing = this.journal.activeJob;
+      if (existing && existing.contentHash !== contentHash) {
+        return { error: `还有未完成的施工「${existing.label}」（${existing.phase}）。先用 abandon 明确放弃旧任务后再换图纸；不会同时混建两份图纸。` };
+      }
+      if (existing && ((existing.planId ?? '') !== (plan?.planId ?? '') || (existing.stepId ?? '') !== (plan?.stepId ?? ''))) {
+        return { error: `施工「${existing.label}」属于另一个计划步骤或手动任务，不能重复接管；先 abandon 明确处理。` };
+      }
+      const job = existing ?? this.journal.createJob({
+        label,
+        dimension,
+        blocks,
+        clear,
+        origin: meta.origin,
+        planId: plan?.planId,
+        stepId: plan?.stepId,
+        phase: 'SECURING',
+        maxAttempts: 12,
+      });
+      if (existing) this.journal?.updateJob(job.id, { phase: 'SECURING', interruptionReason: null });
+      // 恢复时以日志里的规范图纸和所有权台账为准，忽略调用方可能带来的游标 / 伪造台账。
+      args.blocks = job.blocks;
+      args.clear = job.clear;
+      args.ownedTemporary = job.ownedTemporary;
+      return { jobId: job.id };
+    } catch (error) {
+      return { error: `建立施工恢复记录失败：${(error as Error).message}` };
+    }
   }
 
   /** 创造模式盖房子：这里用 RCON 一层层放（不走身体），放完一层撤一层虚影 */
@@ -580,10 +924,14 @@ export class MinecraftSession implements GameSession {
     const target = this.options.rcon;
     const bp = this.designs.get(title);
     const abort = new AbortController();
-    const running: Running = { id: randomUUID(), label, startedAt: Date.now(), inventory: { ...(this.snapshot?.body?.inventory ?? {}) }, meta, abort };
+    const running: Running = { runId: randomUUID(), id: randomUUID(), label, startedAt: Date.now(), inventory: { ...(this.snapshot?.body?.inventory ?? {}) }, meta, abort };
     this.running = running;
     this.options.onAction?.(label);
     this.options.record({ type: 'act', text: label });
+    this.options.record({
+      type: 'minecraft_action', phase: 'started', runId: running.runId, actionId: running.id,
+      action: 'creative_build', label,
+    });
     const total = bp ? placements(bp, origin).length : 0;
     const fail = (message: string): MinecraftActionResult => ({
       actionId: running.id, outcome: 'failed', summary: message, durationMs: Date.now() - running.startedAt, inventoryDelta: {}, worldChanges: [], observations: [],
@@ -776,27 +1124,66 @@ export class MinecraftSession implements GameSession {
     return isShapeText(text) ? parseShapes(text, (n) => this.designs.get(n)) : parseBlueprint(text);
   }
 
-  /** 身体开始做一件长动作（做完自动接着做排队的下一件） */
-  private begin(bodyAction: string, args: Record<string, unknown>, label: string, meta?: JournalMeta): void {
+  /** 身体开始做一件长动作（原 handler 停妥后才接着做排队的下一件） */
+  private begin(
+    bodyAction: string,
+    args: Record<string, unknown>,
+    label: string,
+    meta?: JournalMeta,
+    jobId?: string,
+    plan?: PlanActionRef,
+    maintenance?: LightingMaintenanceRef,
+  ): void {
     const runtime = this.runtime;
-    if (!runtime) return;
+    if (!runtime || this.running || this.disconnected) return;
     if (bodyAction === 'creative_build') {
       this.beginCreativeBuild(String(args.title), args.origin as { x: number; y: number; z: number }, label, meta);
       return;
     }
+    if (jobId && this.journal?.activeJob?.id === jobId) {
+      const job = this.journal.activeJob;
+      if (job.attempts >= job.maxAttempts) {
+        this.journal?.updateJob(jobId, { phase: 'BLOCKED', interruptionReason: '施工恢复次数已用尽，需要重新评估场地或图纸。' });
+        if (plan) this.failPlanBeforeDispatch(plan, '施工恢复次数已用尽，需要重新评估场地或图纸。');
+        else {
+          this.push(`${label}：恢复次数已用尽，已阻塞，不会继续盲目重试。`, true);
+          this.pumpQueue();
+        }
+        return;
+      }
+      this.journal?.updateJob(jobId, { phase: 'SECURING', interruptionReason: null, attempts: job.attempts + 1 });
+      args.ownedTemporary = job.ownedTemporary;
+    }
     const id = randomUUID();
-    const running: Running = { id, label, startedAt: Date.now(), inventory: { ...(this.snapshot?.body?.inventory ?? {}) }, meta, bodyAction, args };
+    const step = plan && this.plan?.id === plan.planId ? this.plan.steps.find((candidate) => candidate.id === plan.stepId) : undefined;
+    const running: Running = {
+      runId: id, id, label, startedAt: Date.now(), inventory: { ...(this.snapshot?.body?.inventory ?? {}) },
+      meta, bodyAction, args, jobId, plan, maintenance,
+      ...(plan ? { progressSignature: canonicalJson(this.realProgress(step)) } : {}),
+    };
     this.running = running;
+    this.trackSettlement(id);
     this.options.onAction?.(label);
     this.options.record({ type: 'act', text: label });
+    this.options.record({
+      type: 'minecraft_action', phase: 'started', runId: running.runId, actionId: id,
+      action: bodyAction, label, planId: plan?.planId, stepId: plan?.stepId, attempt: plan?.attempt,
+      role: plan?.role, maintenance: maintenance?.kind,
+    });
     void runtime.command<MinecraftActionResult>('execute-action', { id, name: bodyAction, args }, 0)
       .then(async (r) => {
-        // 矿石、石头这类：挖下来掉的是别的东西（iron_ore 掉 raw_iron），按「物品」找不到来源 → 按方块再来一次
+        // 矿石、石头这类：挖下来掉的是别的东西（iron_ore 掉 raw_iron），按「物品」找不到来源 → 按方块再来一次。
+        // 第二次执行使用新 ID，并先等第一次的 finally 清理结束，不能复用已经 settled 的屏障。
         if (bodyAction === 'collect_item' && r.outcome === 'failed' && /cannot resolve source blocks/.test(String(r.error?.details?.message ?? r.summary)) && this.running === running) {
+          await this.waitForSettlement(running.id);
+          if (this.running !== running) return;
+          const fallbackId = randomUUID();
+          running.id = fallbackId;
+          this.trackSettlement(fallbackId);
           const blockArgs = { block: args.item, quantity: args.quantity, maxCount: args.quantity, radius: args.radius };
-          r = await runtime.command<MinecraftActionResult>('execute-action', { id, name: 'collect_item', args: blockArgs }, 0);
+          r = await runtime.command<MinecraftActionResult>('execute-action', { id: fallbackId, name: 'collect_item', args: blockArgs }, 0);
         }
-        this.finishRunning(running, r);
+        await this.finishRunning(running, r);
       })
       .catch((err) => this.finishRunning(running, null, (err as Error).message));
   }
@@ -852,6 +1239,23 @@ export class MinecraftSession implements GameSession {
     return this.runtime!.command<MinecraftActionResult>(command, { id: randomUUID(), name, args }, timeoutMs);
   }
 
+  private trackSettlement(actionId: string): void {
+    if (this.settlements.has(actionId)) return;
+    let done!: () => void;
+    const promise = new Promise<void>((resolve) => { done = resolve; });
+    this.settlements.set(actionId, { promise, done });
+  }
+
+  /** response 只代表结果已返回；续作必须等原 handler 的 finally 也完成。 */
+  private async waitForSettlement(actionId: string): Promise<void> {
+    await this.settlements.get(actionId)?.promise;
+  }
+
+  private settleAll(): void {
+    for (const settlement of this.settlements.values()) settlement.done();
+    this.settlements.clear();
+  }
+
   /** 死了告诉她：东西还在不在身上按服务器的「死亡不掉落」（keepInventory，主人可能直播中途改）说；查不到就两种都说 */
   private async deathNote(position?: { x: number; y: number; z: number }): Promise<void> {
     const reply = this.options.rcon ? await rcon(this.options.rcon, 'gamerule keepInventory').catch(() => '') : '';
@@ -863,15 +1267,26 @@ export class MinecraftSession implements GameSession {
   }
 
   /** 被自保的事打断的那件事，之后怎么接着做（不能接着做的返回 null）：采集只补还差的数量 */
-  private resumeOf(was: Running): { bodyAction: string; args: Record<string, unknown>; label: string; meta?: JournalMeta } | null {
+  private resumeOf(was: Running): QueuedAction | null {
+    // 计划动作必须由计划泵重新读取状态后展开，不能绕过谓词和恢复预算直接重放。
+    if (was.plan || was.maintenance) return null;
     if (was.abort || !was.bodyAction || !was.args || !RESUMABLE.has(was.bodyAction)) return null;
-    if (was.bodyAction !== 'collect_item') return { bodyAction: was.bodyAction, args: was.args, label: was.label, meta: was.meta };
+    if (was.bodyAction !== 'collect_item') {
+      const args = { ...was.args };
+      if (was.jobId && this.journal?.activeJob?.id === was.jobId) {
+        const job = this.journal.activeJob;
+        args.blocks = job.blocks;
+        args.clear = job.clear;
+        args.ownedTemporary = job.ownedTemporary;
+      }
+      return { bodyAction: was.bodyAction, args, label: was.label, meta: was.meta, jobId: was.jobId };
+    }
     const item = String(was.args.item ?? was.args.block ?? '');
     const now = this.snapshot?.body?.inventory ?? {};
     const got = (now[item] ?? 0) - (was.inventory[item] ?? 0);
     const left = Number(was.args.quantity ?? 1) - Math.max(0, got);
     if (left <= 0) return null;
-    return { bodyAction: 'collect_item', args: { ...was.args, quantity: left }, label: `采集 ${item} ×${left}`, meta: was.meta };
+    return { bodyAction: 'collect_item', args: { ...was.args, quantity: left }, label: `采集 ${item} ×${left}`, meta: was.meta, jobId: was.jobId };
   }
 
   /** 新的长动作要开始：停掉正在做的（返回原来在做什么） */
@@ -882,6 +1297,7 @@ export class MinecraftSession implements GameSession {
     was.abort?.abort();
     await this.runtime?.command('cancel-action', { actionId: was.id }, 10_000).catch(() => {});
     await this.runtime?.command('stop', {}, 10_000).catch(() => {});
+    await this.waitForSettlement(was.id);
     return was.label;
   }
 
@@ -892,24 +1308,498 @@ export class MinecraftSession implements GameSession {
     await Promise.all(ghosts.map((g) => g.clear()));
   }
 
-  private finishRunning(running: Running, result: MinecraftActionResult | null, error?: string): void {
+  private async finishRunning(running: Running, resultValue: MinecraftActionResult | null, error?: string): Promise<void> {
+    let result = resultValue;
+    // 结果必须属于原指令。ID 对不上时不能消费它的世界证据，更不能推进计划。
+    if (result && result.actionId !== running.id) {
+      result = {
+        actionId: running.id,
+        outcome: 'failed',
+        summary: `worker returned mismatched action id ${result.actionId}`,
+        durationMs: Date.now() - running.startedAt,
+        inventoryDelta: {},
+        worldChanges: [],
+        observations: [],
+        error: { code: 'adapter_error', recoverable: false, details: { message: 'mismatched action id' } },
+      };
+    } else if (result && running.jobId) {
+      // 被 stop / 紧急动作顶掉的旧结果不再驱动队列，但它已经实际放出的临时块仍要入账。
+      this.persistBuildEvidence(running, result);
+    }
+
+    // 不只是 cancelled：旧动作无论 failed / unsafe / succeeded，只要已被替换就全部 stale。
+    if (this.running !== running) return;
+    await this.waitForSettlement(running.id);
+    if (this.running !== running) return;
+    this.running = null;
     if (running.meta?.kind === 'build' && this.director) this.director.until = Math.min(this.director.until, Date.now() + 5_000);
-    // 这次盖完了（成没成都一样）：剩下的虚影撤掉
+
+    const evidence = result && running.jobId ? readBuildEvidence(result) : null;
+    const died = Date.now() - this.lastDeathAt < 15_000 || result?.error?.code === 'died';
+    if (running.jobId && this.journal?.activeJob?.id === running.jobId) {
+      const job = this.journal.activeJob;
+      if (result?.outcome === 'succeeded' && evidence && evidence.remaining.length === 0
+        && evidence.remainingClear.length === 0 && evidence.unloaded === 0) {
+        this.journal.clearJob(job.id, 'DONE');
+      } else {
+        const phase: MinecraftBuildPhase = died ? 'RECOVERING'
+          : result?.error?.code === 'unsafe' && result.error.details.requirement === 'clear-hostiles' ? 'DEFENDING'
+            : result?.outcome === 'cancelled' ? 'RECOVERING' : 'BLOCKED';
+        this.journal?.updateJob(job.id, {
+          phase,
+          interruptionReason: error ?? (typeof result?.error?.details?.message === 'string' ? result.error.details.message : undefined) ?? result?.summary ?? '施工没有完成。',
+          ...(evidence ? { ownedTemporary: evidence.temporaryBlocks } : {}),
+        });
+      }
+    }
+
+    // 只有真正完成才撤虚影；暂停、危险、缺料和失败都保留现场，供恢复时继续对照。
+    const buildDone = !!running.jobId && !!result && result.outcome === 'succeeded' && !!evidence
+      && evidence.remaining.length === 0 && evidence.remainingClear.length === 0 && evidence.unloaded === 0;
     const ghost = this.ghosts.get(running.label);
-    if (ghost) {
+    if (ghost && (!running.jobId || buildDone)) {
       this.ghosts.delete(running.label);
       void ghost.clear();
     }
-    // 被新动作顶掉的：不用再报
-    if (this.running !== running && result?.outcome === 'cancelled') return;
-    if (this.running === running) this.running = null;
-    if (result && running.meta) this.recordDone(running.meta, result);
+    if (result && running.meta) this.recordDone(running.meta, result, evidence);
+
+    if (running.plan) {
+      let refreshError: string | undefined;
+      await this.refresh().catch((err) => { refreshError = (err as Error).message; });
+      await this.finishPlanAction(running, result, error, evidence, refreshError);
+    } else if (running.maintenance?.kind === 'lighting') {
+      this.finishLightingMaintenance(running.maintenance, result);
+    }
+    this.options.record({
+      type: 'minecraft_action', phase: 'settled', runId: running.runId, actionId: running.id,
+      action: running.bodyAction ?? 'creative_build', label: running.label,
+      planId: running.plan?.planId, stepId: running.plan?.stepId, attempt: running.plan?.attempt,
+      role: running.plan?.role, maintenance: running.maintenance?.kind,
+      outcome: result?.outcome ?? 'failed', certainty: result?.certainty ?? (result ? 'certain' : 'uncertain'),
+      errorCode: result?.error?.code ?? (error ? 'adapter_error' : undefined), recoverable: result?.error?.recoverable,
+      durationMs: Date.now() - running.startedAt,
+      inventoryDelta: result ? { ...result.inventoryDelta } : {},
+      worldChanges: (result?.worldChanges ?? []).map((change) => ({
+        kind: change.kind, name: change.name, count: change.count ?? 1,
+      })),
+      ...(evidence ? { buildEvidence: {
+        completed: evidence.completed, remaining: evidence.remaining.length,
+        remainingClear: evidence.remainingClear.length, unloaded: evidence.unloaded,
+        temporaryBlocks: evidence.temporaryBlocks.length,
+      } } : {}),
+    });
+
+    if (died) {
+      const again = this.resumeOf(running);
+      if (again && !this.queue.some((item) => item.jobId && item.jobId === again.jobId)) this.queue.unshift(again);
+      this.recoveryAt = Date.now() + 5_000;
+    } else if (result?.outcome !== 'succeeded') {
+      this.recoveryAt = Date.now() + 2_000;
+    }
     const seconds = Math.round((Date.now() - running.startedAt) / 1000);
     const text = result ? describeResult(result, running.label) : `${running.label}：出错了（${error}）`;
     this.options.onAction?.(text);
-    const next = !this.running && !this.disconnected ? this.queue.shift() : undefined;
-    this.push(`${text}（用了 ${seconds} 秒）${next ? `；接着做排着的「${next.label}」` : ''}`, true);
-    if (next) this.begin(next.bodyAction, next.args, next.label, next.meta);
+    this.push(`${text}（用了 ${seconds} 秒）${this.queue.length ? `；还有 ${this.queue.length} 件等安全条件满足后接着做` : ''}`, true);
+    this.pumpQueue();
+  }
+
+  /** 队列只有一个出口；死亡 / 战斗后的恢复必须等复活、威胁平息和冷却。 */
+  private pumpQueue(): void {
+    if (this.running || this.disconnected || !this.runtime) return;
+    if (!this.queue.length) {
+      this.pumpPlan();
+      return;
+    }
+    if (this.recoveryAt) {
+      const health = this.snapshot?.body?.health;
+      const danger = hostiles(this.snapshot).some((entity) => entity.distance <= 10);
+      if (Date.now() < this.recoveryAt || danger || (typeof health === 'number' && health < 12)) {
+        this.recoveryAt = Math.max(this.recoveryAt, Date.now() + POLL_MS);
+        return;
+      }
+      this.recoveryAt = 0;
+    }
+    const next = this.queue.shift()!;
+    this.begin(next.bodyAction, next.args, next.label, next.meta, next.jobId, next.plan, next.maintenance);
+  }
+
+  /** Poll-driven, low-priority lighting. It never starts a worker timer or a second navigation owner. */
+  private scheduleLightingMaintenance(): void {
+    const s = this.snapshot;
+    const body = s?.body;
+    const sample = s?.lighting;
+    if (this.options.creative || !s || s.stale || this.disconnected || !body || !sample || !s.world?.dimension) return;
+    const context = {
+      dimension: this.dimension(), version: this.status?.version ?? undefined, timeOfDay: s.world.timeOfDay,
+    };
+    const visibility = needsLighting(sample, { ...context, policy: 'visibility' });
+    const spawnRisk = needsLighting(sample, { ...context, policy: 'spawn-risk' });
+    const position = {
+      x: Math.floor(body.position.x), y: Math.floor(body.position.y), z: Math.floor(body.position.z),
+    };
+    const key = `${this.dimension()}:${position.x},${position.y},${position.z}`;
+    const now = Date.now();
+    if (this.lightingPosition?.key !== key) this.lightingPosition = { key, since: now };
+    const time = s.world.timeOfDay === undefined ? undefined : ((s.world.timeOfDay % 24_000) + 24_000) % 24_000;
+    const night = time !== undefined && time >= 12_500 && time <= 23_500;
+    const stationarySince = Math.max(this.lightingPosition.since, this.running?.startedAt ?? now);
+    const longStationaryTask = !!this.running && now - stationarySince >= 20_000;
+    const spawnMaintenance = spawnRisk === true && (night || sample.canSeeSky === false || longStationaryTask);
+    if (visibility !== true && !spawnMaintenance) {
+      if (visibility === false && spawnRisk === false) this.lightingMaintenance.delete(key);
+      return;
+    }
+    if (this.running?.bodyAction === 'ensure_lighting'
+      || this.queue.some((item) => item.bodyAction === 'ensure_lighting')) return;
+    const state = this.lightingMaintenance.get(key) ?? { attempts: 0, nextAt: 0, exhaustionNotified: false };
+    if (now < state.nextAt) return;
+    if (state.attempts >= 2) {
+      // Two unsuccessful bounded actions are one cycle. Wait before a fresh cycle instead of torch spam.
+      this.lightingMaintenance.set(key, { attempts: 0, nextAt: now + POLL_MS, exhaustionNotified: false });
+      return;
+    }
+    const current = this.plan?.steps.find((step) => step.status === 'running');
+    const torchSupplyRunning = current?.skill === 'ensure_torches'
+      || (this.running?.bodyAction === 'craft_item' && this.running.args?.item === 'torch')
+      || this.queue.some((item) => item.bodyAction === 'craft_item' && item.args.item === 'torch');
+    const torches = body.inventory.torch ?? body.inventory['minecraft:torch'] ?? 0;
+    if (torches < 1) {
+      if (!torchSupplyRunning) {
+        this.push('当前位置太暗，而且背包里没有火把。需要先通过结构化计划补给火把，或选择安全撤退；不会摸黑盲目续作。', true);
+      }
+      this.rememberLightingMaintenance(key, { attempts: 0, nextAt: now + 60_000, exhaustionNotified: false });
+      return;
+    }
+
+    const attempt = state.attempts + 1;
+    const policy: MinecraftLightingPolicy = visibility === true ? 'visibility' : 'spawn-risk';
+    const protectedCells = this.lightingProtectedCells();
+    this.rememberLightingMaintenance(key, { attempts: attempt, nextAt: now + 10_000, exhaustionNotified: false });
+    this.queue.unshift({
+      bodyAction: 'ensure_lighting',
+      args: {
+        radius: 6, verticalRadius: 2, maxTorches: 4, policy,
+        ...(protectedCells.length ? { protectedCells } : {}),
+      },
+      label: `主动检查${policy === 'visibility' ? '能见度' : '刷怪风险'}照明`,
+      maintenance: { kind: 'lighting', key, attempt },
+    });
+  }
+
+  private rememberLightingMaintenance(key: string, state: LightingMaintenanceState): void {
+    this.lightingMaintenance.delete(key);
+    this.lightingMaintenance.set(key, state);
+    if (this.lightingMaintenance.size > 64) {
+      this.lightingMaintenance.delete(this.lightingMaintenance.keys().next().value!);
+    }
+  }
+
+  private lightingProtectedCells(): { x: number; y: number; z: number }[] {
+    const job = this.journal?.activeJob;
+    const step = this.plan?.steps.find((candidate) => candidate.status === 'running');
+    const planned = step && ['build_resume', 'secure_build_site'].includes(step.skill) ? step.args : undefined;
+    const source = job
+      ? [...job.blocks, ...job.clear]
+      : [...(Array.isArray(planned?.blocks) ? planned.blocks : []), ...(Array.isArray(planned?.clear) ? planned.clear : [])];
+    const cells: { x: number; y: number; z: number }[] = [];
+    const seen = new Set<string>();
+    for (const value of source.slice(0, 4096)) {
+      if (!value || typeof value !== 'object') continue;
+      const cell = value as Record<string, unknown>;
+      if (!['x', 'y', 'z'].every((key) => Number.isSafeInteger(cell[key]))) continue;
+      const position = { x: Number(cell.x), y: Number(cell.y), z: Number(cell.z) };
+      const key = `${position.x},${position.y},${position.z}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cells.push(position);
+    }
+    return cells;
+  }
+
+  private finishLightingMaintenance(ref: LightingMaintenanceRef, result: MinecraftActionResult | null): void {
+    const now = Date.now();
+    if (result?.outcome === 'succeeded') {
+      // The body succeeded only after a real bounded rescan; the next poll still refreshes the body sample.
+      this.rememberLightingMaintenance(ref.key, { attempts: 0, nextAt: now + 30_000, exhaustionNotified: false });
+      return;
+    }
+    const attempts = Math.max(1, ref.attempt);
+    const exhausted = attempts >= 2;
+    this.rememberLightingMaintenance(ref.key, {
+      attempts, nextAt: now + (exhausted ? 60_000 : 5_000), exhaustionNotified: exhausted,
+    });
+    if (exhausted) {
+      this.push('主动照明连续两次没有完成，已暂停这一位置的自动重试；请检查火把、支撑、区块加载或路线。', true);
+    }
+  }
+
+  /** Active mode expands exactly one bounded body action; shadow mode only consumes real evidence. */
+  private pumpPlan(): void {
+    if (this.pumpingPlan || this.running || this.queue.length || this.disconnected || !this.runtime || !this.plan) return;
+    if (this.recoveryAt && Date.now() < this.recoveryAt) return;
+    const plan = this.plan;
+    if (plan.status === 'done') return;
+    const step = plan.steps.find((candidate) => candidate.status === 'running')
+      ?? plan.steps.find((candidate) => candidate.status !== 'done');
+    if (!step) return;
+    this.pumpingPlan = true;
+    try {
+      if (this.planMode === 'shadow') {
+        if (step.status === 'pending' && evaluateCompletion(step.completion, this.completionObservation(step)) === 'met') {
+          const now = Date.now();
+          this.commitPlan(beginStep(plan, step.id, { now, progress: this.realProgress(step) }));
+          this.commitPlan(completeStep(this.plan!, step.id, this.completionObservation(step), { now: Date.now() }));
+          this.push(`shadow 计划 ${plan.id}/${step.id}：真实状态已经满足完成谓词。`, false);
+          queueMicrotask(() => this.pumpQueue());
+        }
+        return;
+      }
+      if (plan.status === 'blocked') return;
+      if (step.status === 'blocked') {
+        if (step.pendingRecovery) {
+          // started=true means a result or restart reconciliation must arrive first.
+          if (step.pendingRecovery.started) return;
+          const pending = step.pendingRecovery;
+          this.commitPlan(markRecoveryStarted(plan, step.id, { now: Date.now() }));
+          const action: SkillAction = {
+            bodyAction: pending.bodyAction as SkillAction['bodyAction'],
+            args: pending.args,
+            label: pending.label,
+            idempotent: pending.idempotent,
+          };
+          const ref = this.planActionRef(step, action, 'recovery', pending.disposition);
+          this.startPlanAction(step, action, ref);
+          return;
+        }
+        if (step.lastFailure?.disposition !== 'retry') return;
+        if (step.nextRetryAt === undefined || Date.now() < step.nextRetryAt) return;
+        this.commitPlan(beginStep(plan, step.id, { now: Date.now(), progress: this.realProgress(step) }));
+      } else if (step.status === 'pending') {
+        this.commitPlan(beginStep(plan, step.id, { now: Date.now(), progress: this.realProgress(step) }));
+      } else if (step.status !== 'running') {
+        return;
+      }
+      const current = this.plan!.steps.find((candidate) => candidate.id === step.id)!;
+      if (evaluateCompletion(current.completion, this.completionObservation(current)) === 'met') {
+        this.commitPlan(completeStep(this.plan!, current.id, this.completionObservation(current), { now: Date.now() }));
+        this.push(`计划步骤 ${current.id} 已完成（真实谓词验收通过）。`, true);
+        queueMicrotask(() => this.pumpQueue());
+        return;
+      }
+      const planned = planSkill(current.skill, current.args, { snapshot: this.snapshot ?? undefined, now: Date.now() });
+      if (!planned.ok) {
+        this.failRunningPlanStep(current, planned.error.code, planned.error.message, 'needs_decision', true);
+        return;
+      }
+      const action = planned.actions[0];
+      if (!action) {
+        this.failRunningPlanStep(current, 'no_applicable_action', '技能没有可执行动作，但真实完成谓词尚未满足。', 'needs_decision', true);
+        return;
+      }
+      const key = `${plan.id}/${current.id}/${current.attempts}`;
+      const count = (this.planActionCounts.get(key) ?? 0) + 1;
+      if (count > 24) {
+        this.failRunningPlanStep(current, 'skill_action_budget', '单个计划步骤已连续执行 24 个动作仍未验收，需要换策略。', 'replan', true);
+        return;
+      }
+      this.planActionCounts.set(key, count);
+      this.startPlanAction(current, action, this.planActionRef(current, action, 'skill'));
+    } catch (error) {
+      this.push(`计划调度 stopped safely：${(error as Error).message}`, true);
+    } finally {
+      this.pumpingPlan = false;
+    }
+  }
+
+  private planActionRef(
+    step: PlanStep,
+    action: SkillAction,
+    role: PlanActionRef['role'],
+    recovery?: PlanRecovery,
+  ): PlanActionRef {
+    return {
+      planId: this.plan!.id,
+      stepId: step.id,
+      attempt: step.attempts,
+      idempotent: action.idempotent,
+      role,
+      ...(recovery ? { recovery } : {}),
+      actionKey: canonicalJson({ bodyAction: action.bodyAction, args: action.args }),
+    };
+  }
+
+  private startPlanAction(step: PlanStep, action: SkillAction, ref: PlanActionRef): void {
+    const args = { ...action.args };
+    let jobId: string | undefined;
+    let meta: JournalMeta | undefined;
+    if (action.bodyAction === 'build_structure') {
+      const blueprintId = typeof args.blueprintId === 'string' ? args.blueprintId : step.id;
+      const blocks = Array.isArray(args.blocks) ? args.blocks as { x: number; y: number; z: number }[] : [];
+      const clear = Array.isArray(args.clear) ? args.clear as { x: number; y: number; z: number }[] : [];
+      const suppliedOrigin = args.origin;
+      const origin = suppliedOrigin && typeof suppliedOrigin === 'object'
+        && ['x', 'y', 'z'].every((key) => Number.isSafeInteger((suppliedOrigin as Record<string, unknown>)[key]))
+        ? suppliedOrigin as { x: number; y: number; z: number }
+        : blocks[0] ?? clear[0];
+      if (!origin) {
+        this.failPlanBeforeDispatch(ref, '图纸没有可用于施工记录的原点。');
+        return;
+      }
+      meta = { kind: 'build', name: blueprintId, origin };
+      const prepared = this.prepareBuildJob(`盖「${blueprintId}」`, args, meta, ref);
+      if (prepared.error) {
+        this.failPlanBeforeDispatch(ref, prepared.error);
+        return;
+      }
+      jobId = prepared.jobId;
+      delete args.origin; // journal metadata only; the body BuildRequest has a strict schema.
+    }
+    if (action.bodyAction === 'ensure_lighting') {
+      const prefix = `${ref.planId}/${ref.stepId}/`;
+      for (const key of this.lightingEvidence.keys()) if (key.startsWith(prefix)) this.lightingEvidence.delete(key);
+    }
+    this.begin(action.bodyAction, args, action.label, meta, jobId, ref);
+  }
+
+  private failPlanBeforeDispatch(ref: PlanActionRef, message: string): void {
+    const step = this.plan?.id === ref.planId ? this.plan.steps.find((candidate) => candidate.id === ref.stepId) : undefined;
+    if (!step) return;
+    const now = Date.now();
+    if (ref.role === 'recovery' && step.pendingRecovery) {
+      this.commitPlan(failRecovery(this.plan!, step.id, {
+        now, code: 'dispatch_blocked', message, disposition: 'needs_decision', certainty: 'certain', progress: this.realProgress(step),
+      }));
+    } else if (step.status === 'running') {
+      this.commitPlan(failStep(this.plan!, step.id, {
+        now, code: 'dispatch_blocked', message, disposition: 'replan', certainty: 'certain',
+        idempotent: ref.idempotent, progress: this.realProgress(step),
+      }));
+    }
+    this.push(`计划步骤 ${step.id} 已阻塞：${message}`, true);
+    queueMicrotask(() => this.pumpQueue());
+  }
+
+  private failRunningPlanStep(
+    step: PlanStep,
+    code: string,
+    message: string,
+    disposition: FailureDisposition,
+    certain: boolean,
+    running?: Running,
+  ): void {
+    if (!this.plan || step.status !== 'running') return;
+    this.commitPlan(failStep(this.plan, step.id, {
+      now: Date.now(), code, message, disposition,
+      certainty: certain ? 'certain' : 'uncertain',
+      idempotent: running?.plan?.idempotent ?? false,
+      progress: this.realProgress(step),
+    }));
+    if (this.plan.status === 'blocked') this.push(`计划步骤 ${step.id} 阻塞：${message}`, true);
+  }
+
+  private async finishPlanAction(
+    running: Running,
+    result: MinecraftActionResult | null,
+    error: string | undefined,
+    evidence: BuildEvidence | null,
+    refreshError?: string,
+  ): Promise<void> {
+    const ref = running.plan;
+    if (!ref || this.plan?.id !== ref.planId) return;
+    let step = this.plan.steps.find((candidate) => candidate.id === ref.stepId);
+    if (!step || step.attempts !== ref.attempt) return;
+    if (evidence && running.bodyAction === 'build_structure') {
+      const blueprintId = typeof running.args?.blueprintId === 'string' ? running.args.blueprintId : ref.stepId;
+      this.blueprintEvidence.set(this.evidenceKey(ref.planId, ref.stepId, blueprintId), {
+        remaining: evidence.remaining.length + evidence.remainingClear.length,
+        unloaded: evidence.unloaded,
+      });
+    }
+    if (result && running.bodyAction === 'ensure_lighting') this.rememberLightingEvidence(ref, result);
+    const certainty = !result || result.certainty === 'uncertain' || refreshError
+      || ['timeout', 'unknown', 'adapter_error', 'inventory_desync', 'died'].includes(result.error?.code ?? '')
+      || (result.outcome === 'cancelled' && !ref.idempotent) ? 'uncertain' as const : 'certain' as const;
+
+    if (ref.role === 'recovery') {
+      if (!step.pendingRecovery) return;
+      if (result?.outcome === 'succeeded' && !refreshError) {
+        this.commitPlan(beginStep(this.plan, step.id, {
+          now: Date.now(), recovered: true, progress: this.realProgress(step),
+        }));
+        this.push(`恢复动作完成，重新验收计划步骤 ${step.id}。`, false);
+        return;
+      }
+      const code = result?.error?.code ?? (error || refreshError ? 'adapter_error' : result?.outcome ?? 'unknown');
+      this.commitPlan(failRecovery(this.plan, step.id, {
+        now: Date.now(), code,
+        message: error ?? refreshError ?? result?.summary ?? '恢复动作没有完成。',
+        disposition: 'needs_decision', certainty, progress: this.realProgress(step),
+      }));
+      this.push(`计划步骤 ${step.id} 的恢复动作失败，已停止自动重试。`, true);
+      return;
+    }
+    if (step.status !== 'running') return;
+    const completion = refreshError ? 'unknown' : evaluateCompletion(step.completion, this.completionObservation(step));
+    const buildVerified = !running.jobId || (result?.outcome === 'succeeded' && !!evidence
+      && evidence.remaining.length === 0 && evidence.remainingClear.length === 0 && evidence.unloaded === 0);
+    if (completion === 'met' && buildVerified) {
+      this.commitPlan(completeStep(this.plan, step.id, this.completionObservation(step), { now: Date.now() }));
+      this.push(`计划步骤 ${step.id} 已完成（真实谓词验收通过）。`, true);
+      return;
+    }
+    if (result?.outcome === 'succeeded' && !refreshError) {
+      if (completion === 'unknown') {
+        this.failRunningPlanStep(step, 'completion_unknown', '动作返回成功，但无法取得足够的真实状态验收。', ref.idempotent ? 'retry' : 'needs_decision', false, running);
+        return;
+      }
+      const planned = planSkill(step.skill, step.args, { snapshot: this.snapshot ?? undefined, now: Date.now() });
+      const next = planned.ok ? planned.actions[0] : undefined;
+      const nextKey = next ? canonicalJson({ bodyAction: next.bodyAction, args: next.args }) : '';
+      const progress = canonicalJson(this.realProgress(step));
+      if (next && (nextKey !== ref.actionKey || progress !== running.progressSignature)) return;
+      this.failRunningPlanStep(step, 'postcondition_unmet', '动作返回成功，但完成谓词仍未满足且没有新的真实进展。', ref.idempotent ? 'retry' : 'needs_decision', true, running);
+      return;
+    }
+
+    const code = result?.error?.code ?? (error || refreshError ? 'adapter_error' : result?.outcome ?? 'unknown');
+    const details = { ...(result?.error?.details ?? {}), ...(error || refreshError ? { message: error ?? refreshError } : {}) };
+    const recovery = planFailureRecovery({
+      code, details, certainty, idempotent: ref.idempotent, recoveryAttempts: step.recoveryAttempts ?? 0,
+    }, { snapshot: this.snapshot ?? undefined, now: Date.now() });
+    let disposition: FailureDisposition = 'needs_decision';
+    let recoveryAction: SkillAction | null = null;
+    let recoveryAttempts = step.recoveryAttempts ?? 0;
+    if (recovery.ok && recovery.action && ['supply', 'defence', 'reroute'].includes(recovery.disposition)) {
+      disposition = recovery.disposition as PlanRecovery;
+      recoveryAction = recovery.action;
+      recoveryAttempts = recovery.recoveryAttempts;
+    } else if (recovery.ok && recovery.disposition === 'budget_exhausted') {
+      disposition = 'replan';
+    } else if (ref.idempotent && result?.error?.recoverable
+      && ['timeout', 'cancelled', 'died', 'path_unreachable', 'blocked', 'target_not_found', 'unknown'].includes(code)) {
+      disposition = 'retry';
+    }
+    this.commitPlan(failStep(this.plan, step.id, {
+      now: Date.now(), code, message: error ?? refreshError ?? result?.summary ?? '动作失败。',
+      disposition, certainty, idempotent: ref.idempotent, progress: this.realProgress(step), recoveryAttempts,
+      ...(recoveryAction ? { recovery: {
+        disposition: disposition as PlanRecovery,
+        bodyAction: recoveryAction.bodyAction,
+        args: recoveryAction.args as JsonObject,
+        label: recoveryAction.label,
+        idempotent: recoveryAction.idempotent,
+      } } : {}),
+    }));
+    step = this.plan.steps.find((candidate) => candidate.id === ref.stepId)!;
+    if (step.pendingRecovery) this.push(`计划步骤 ${step.id} 需要${step.pendingRecovery.disposition}，将执行一个有界恢复动作后重新验收。`, true);
+    else if (this.plan.status === 'blocked') this.push(`计划步骤 ${step.id} 阻塞：${result?.summary ?? error ?? code}`, true);
+  }
+
+  private persistBuildEvidence(running: Running, result: MinecraftActionResult): void {
+    if (!running.jobId || this.journal?.activeJob?.id !== running.jobId) return;
+    const evidence = readBuildEvidence(result);
+    if (!evidence) return;
+    this.journal?.updateJob(running.jobId, { ownedTemporary: evidence.temporaryBlocks });
   }
 
   private onBodyEvent(event: MinecraftRuntimeEvent): void {
@@ -926,20 +1816,28 @@ export class MinecraftSession implements GameSession {
         this.players = now;
         break;
       }
-      case 'build-progress':
+      case 'build-progress': {
+        const job = this.running?.jobId && this.journal?.activeJob?.id === this.running.jobId ? this.journal.activeJob : null;
+        if (job && job.phase !== 'BUILDING') this.journal?.updateJob(job.id, { phase: 'BUILDING', interruptionReason: null });
         this.push(event.text, false);
         break;
+      }
       case 'build-placed':
         if (this.running) this.ghosts.get(this.running.label)?.remove(event);
         break;
-      case 'death':
+      case 'death': {
         this.lastDeathAt = Date.now();
-        // 正在做的事由身体自己报（死的时候它会停掉并回报），这里不清，免得两边对不上
-        this.queue = [];
+        this.options.record({ type: 'minecraft_death', ...(event.position ? { position: { ...event.position } } : {}) });
+        this.recoveryAt = Date.now() + 5_000;
+        // 可恢复的队列保留；合成、熔炼、繁殖等非幂等动作仍丢弃，不能在结果不明时重放。
+        this.queue = this.queue.filter((item) => !item.plan && !item.maintenance && RESUMABLE.has(item.bodyAction));
+        const job = this.journal?.activeJob;
+        if (job) this.journal?.updateJob(job.id, { phase: 'RECOVERING', interruptionReason: '死亡，等待复活和场地安全后按世界差量恢复。' });
         if (event.position) this.journal?.addDeath({ x: Math.floor(event.position.x), y: Math.floor(event.position.y), z: Math.floor(event.position.z), dimension: this.dimension() });
         void this.deathNote(event.position);
         setTimeout(() => void this.attachSpectators(), 3000);
         break;
+      }
       case 'food-shortage':
         this.push(`饿了（饥饿值 ${event.food}/20），背包里没有能吃的。`, true);
         break;
@@ -958,13 +1856,26 @@ export class MinecraftSession implements GameSession {
       case 'movement-blocked':
         this.push(`跟着 ${event.player} 走的时候被挡住了，过不去（离他 ${Math.round(event.distance)} 格）。`, true);
         break;
-      case 'disconnected':
+      case 'disconnected': {
         this.status = this.status ? { ...this.status, connected: false } : null;
         this.disconnected = true;
         this.running = null;
-        this.queue = [];
-        this.push(`和服务器断开了：${event.reason}`, true);
+        this.queue = this.queue.filter((item) => !item.plan && !item.maintenance && RESUMABLE.has(item.bodyAction));
+        const job = this.journal?.activeJob;
+        if (job) this.journal?.updateJob(job.id, { phase: 'RECOVERING', interruptionReason: `连接中断：${event.reason}` });
+        // worker 已退出，旧 handler 不可能再写世界；让所有等待屏障的调用收尾，但不自动续作。
+        this.settleAll();
+        this.restorePersistedPlan();
+        this.push(`和服务器断开了：${event.reason}。可恢复任务已保留。`, true);
         break;
+      }
+      case 'action-handler-settled': {
+        const settlement = this.settlements.get(event.actionId);
+        if (!settlement) break; // unknown / stale ID 本来就允许出现
+        this.settlements.delete(event.actionId);
+        settlement.done();
+        break;
+      }
       default:
         break;
     }
@@ -1008,6 +1919,8 @@ export class MinecraftSession implements GameSession {
       if (this.seenHostiles.size > 200) this.seenHostiles.clear();
       this.push(`${fmtEntity(e)} 靠过来了`, false);
     }
+    this.scheduleLightingMaintenance();
+    this.pumpQueue();
   }
 
   private async refresh(): Promise<void> {
@@ -1253,6 +2166,96 @@ export class MinecraftSession implements GameSession {
 
   // ───────────────────────── 世界日志 ─────────────────────────
 
+  /** A replaced plan action must become an explained interruption before another owner starts. */
+  private interruptPlan(reason: string): void {
+    if (!this.plan) return;
+    const ref = this.running?.plan;
+    if (!ref || ref.planId !== this.plan.id) return;
+    const step = this.plan.steps.find((candidate) => candidate.id === ref.stepId);
+    if (!step) return;
+    const now = Math.max(Date.now(), this.plan.updatedAt);
+    if (ref.role === 'recovery' && step.pendingRecovery) {
+      if (ref.idempotent) this.commitPlan(resetRecoveryStarted(this.plan, step.id, { now }));
+      else this.commitPlan(failRecovery(this.plan, step.id, {
+        now, code: 'cancelled', message: reason, disposition: 'needs_decision', certainty: 'uncertain', progress: this.realProgress(step),
+      }));
+    } else if (step.status === 'running') {
+      this.commitPlan(failStep(this.plan, step.id, {
+        now, code: 'cancelled', message: reason, disposition: ref.idempotent ? 'retry' : 'needs_decision',
+        certainty: 'uncertain', idempotent: ref.idempotent, progress: this.realProgress(step),
+      }));
+    }
+  }
+
+  private pausePlan(reason: string): void {
+    if (!this.plan) return;
+    this.setPlanMode('shadow');
+    this.interruptPlan(reason);
+  }
+
+  /** Restart reconciliation: persisted running is an interrupted attempt, never proof of success. */
+  private restorePersistedPlan(): void {
+    if (!this.plan) return;
+    const running = this.plan.steps.find((step) => step.status === 'running');
+    if (running) {
+      const idempotent = new Set(['build_resume', 'ensure_lighting', 'equip_best_loadout']).has(running.skill);
+      this.commitPlan(failStep(this.plan, running.id, {
+        now: Math.max(Date.now(), this.plan.updatedAt),
+        code: 'interrupted', message: '进程或连接中断，已按动作可确定性决定恢复或交回决策。',
+        disposition: idempotent ? 'retry' : 'needs_decision', certainty: 'uncertain', idempotent,
+        progress: this.realProgress(running),
+      }));
+    }
+    for (const step of this.plan.steps) {
+      if (!step.pendingRecovery?.started) continue;
+      const now = Math.max(Date.now(), this.plan.updatedAt);
+      if (step.pendingRecovery.idempotent) this.commitPlan(resetRecoveryStarted(this.plan, step.id, { now }));
+      else this.commitPlan(failRecovery(this.plan, step.id, {
+        now, code: 'interrupted', message: '非幂等恢复动作在中断前已下发，结果不明，不能自动重放。',
+        disposition: 'needs_decision', certainty: 'uncertain', progress: this.realProgress(step),
+      }));
+    }
+    if (this.plan.status === 'blocked') {
+      const step = this.plan.steps.find((candidate) => candidate.status === 'blocked');
+      this.push(`计划 ${this.plan.id} 需要重新决策：${step?.lastFailure?.message ?? step?.lastFailure?.code ?? '中断结果不明'}。`, true);
+    }
+  }
+
+  /** 新进程 / 重连只从规范图纸恢复；真正的完成量仍由 buildStructure 重读世界计算。 */
+  private restorePersistedWork(): void {
+    const job = this.journal?.activeJob;
+    if (!job || this.running || this.queue.some((item) => item.jobId === job.id)) return;
+    // 计划施工由同一 plan step 恢复，不能再作为手动任务另排一份。
+    if (job.planId) return;
+    if (job.phase === 'BLOCKED') {
+      this.push(`施工「${job.label}」仍处于阻塞：${job.interruptionReason ?? '需要重新评估'}。`, true);
+      return;
+    }
+    if (job.dimension !== this.dimension()) {
+      this.journal?.updateJob(job.id, { phase: 'BLOCKED', interruptionReason: `施工在 ${job.dimension}，当前在 ${this.dimension()}；需要先安全返回原维度。` });
+      this.push(`施工「${job.label}」在另一个维度，不能隔着维度自动续建。`, true);
+      return;
+    }
+    const title = job.label.match(/「(.+)」/)?.[1] ?? job.label;
+    const meta: JournalMeta | undefined = job.origin ? { kind: 'build', name: title, origin: job.origin } : undefined;
+    this.queue.push({
+      bodyAction: 'build_structure',
+      args: { label: job.label.replace(/^盖/, ''), blocks: job.blocks, clear: job.clear, ownedTemporary: job.ownedTemporary },
+      label: job.label,
+      meta,
+      jobId: job.id,
+    });
+    if (this.options.rcon) {
+      const ghost = new GhostBuild(this.options.rcon, `b${++this.ghostSeq}`, this.options.log);
+      this.ghosts.set(job.label, ghost);
+      if (job.blocks.length <= GHOST_MAX) void ghost.show(job.blocks);
+      const bp = this.designs.get(title);
+      if (bp && job.origin) this.directAt(bp, job.origin);
+    }
+    this.push(`接上未完成的施工「${job.label}」：先重新检查安全，再按当前世界差量续建。`, true);
+    this.pumpQueue();
+  }
+
   /** 开局：打开这个世界的日志，接上目标和图纸；返回给她的「这个世界」那段 */
   private async openJournal(): Promise<string> {
     const dir = this.options.journalDir;
@@ -1261,6 +2264,8 @@ export class MinecraftSession implements GameSession {
     try {
       const { journal, note } = WorldJournal.open(dir, `${this.options.host}:${this.options.port}`, this.options.username, seed);
       this.journal = journal;
+      this.plan = journal.activePlan ?? null;
+      this.planMode = journal.planMode;
       if (!this.goal && journal.goal) this.goal = journal.goal;
       // 字符图先接上，形状图纸后接（它可能引用别的图纸）；旧的先接
       const saved = [...journal.designs].reverse();
@@ -1278,16 +2283,20 @@ export class MinecraftSession implements GameSession {
   }
 
   /** 身体做完一件要记的事 */
-  private recordDone(meta: JournalMeta, r: MinecraftActionResult): void {
+  private recordDone(meta: JournalMeta, r: MinecraftActionResult, evidence?: BuildEvidence | null): void {
     const j = this.journal;
-    if (!j || r.outcome === 'cancelled') return;
+    if (!j) return;
     const dimension = this.dimension();
     if (meta.kind === 'build') {
-      const m = r.summary.match(/(\d+)\/(\d+) blocks/);
-      const done = m ? Number(m[1]) : r.outcome === 'succeeded' ? 1 : 0;
-      const total = m ? Number(m[2]) : 1;
-      if (done > 0) j.addBuilding(meta.name, { ...meta.origin, dimension }, done, total);
-    } else if (meta.kind === 'farm') {
+      // 建筑完成度只能来自建造器的真实世界差量；summary 是给人看的，绝不是状态来源。
+      if (!evidence) return;
+      const total = this.journal?.activeJob?.blocks.length ?? evidence.completed + evidence.remaining.length;
+      const done = Math.min(total, evidence.completed);
+      if (done > 0 || r.outcome === 'succeeded') j.addBuilding(meta.name, { ...meta.origin, dimension }, done, total);
+      return;
+    }
+    if (r.outcome === 'cancelled') return;
+    if (meta.kind === 'farm') {
       if (r.outcome === 'succeeded' || r.outcome === 'partial') j.addField(meta.crop, { ...meta.corner, dimension }, meta.size);
     } else if (meta.kind === 'sleep') {
       const p = this.snapshot?.body?.position;
@@ -1328,6 +2337,13 @@ export class MinecraftSession implements GameSession {
     this.lines = [];
     const notes: string[] = [];
     notes.push(this.goal ? `你的目标（${this.goalAt ? `你 ${new Date(this.goalAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })} 写的` : '上一局写的'}）：${this.goal}` : '你还没写下目标（想做什么可以用 goal 写下来）。');
+    if (this.plan) {
+      const step = this.plan.steps.find((candidate) => candidate.status === 'running')
+        ?? this.plan.steps.find((candidate) => candidate.status !== 'done');
+      const failure = step?.lastFailure ? `；最近失败 ${step.lastFailure.code}/${step.lastFailure.disposition}` : '';
+      notes.push(`结构化计划 ${this.plan.id}：${this.plan.status}，${this.planMode} 模式${step ? `；当前步骤 ${step.id}/${step.skill}/${step.status}${failure}` : '；没有待执行步骤'}。`);
+    }
+    if (s?.lighting) notes.push(`当前位置光照：方块光 ${s.lighting.blockLight ?? '未知'}/15，天空光 ${s.lighting.skyLight ?? '未知'}/15，${s.lighting.loaded ? '区块已加载' : '区块未加载（不能当成黑暗）'}。`);
     if (this.running) {
       const progress = inventoryChange(this.running.inventory, s?.body?.inventory);
       notes.push(`身体正在：${this.running.label}（${Math.round((Date.now() - this.running.startedAt) / 1000)} 秒了${progress ? `，到现在背包 ${progress}` : ''}）`);
@@ -1350,6 +2366,7 @@ export class MinecraftSession implements GameSession {
     };
     this.firstMoment = false;
     this.options.record({ type: 'moment', seq: moment.seq, reason, where: moment.where, lines: lines.length });
+    this.lastMoment = moment;
     return moment;
   }
 
@@ -1382,6 +2399,45 @@ function formatActionList(): string {
       return `- action=${a.action}${params.length ? `，${params.join('，')}` : ''}：${a.description}`;
     }),
   ].join('\n');
+}
+
+interface BuildEvidence {
+  completed: number;
+  remaining: MinecraftBuildJob['blocks'];
+  remainingClear: MinecraftBuildJob['clear'];
+  unloaded: number;
+  temporaryBlocks: MinecraftBuildJob['ownedTemporary'];
+}
+
+function readBuildEvidence(result: MinecraftActionResult): BuildEvidence | null {
+  const data = result.observations.find((observation) => observation.kind === 'build-evidence')?.data;
+  if (!data || !Number.isSafeInteger(data.completed) || Number(data.completed) < 0
+    || !Number.isSafeInteger(data.unloaded) || Number(data.unloaded) < 0
+    || !Array.isArray(data.remaining) || !Array.isArray(data.remainingClear) || !Array.isArray(data.temporaryBlocks)) return null;
+  const position = (value: unknown): value is { x: number; y: number; z: number } => {
+    if (!value || typeof value !== 'object') return false;
+    const p = value as Record<string, unknown>;
+    return ['x', 'y', 'z'].every((key) => Number.isSafeInteger(p[key]));
+  };
+  const remaining: MinecraftBuildJob['blocks'] = [];
+  for (const value of data.remaining) {
+    if (!position(value) || typeof (value as any).name !== 'string' || !(value as any).name
+      || !(value as any).props || typeof (value as any).props !== 'object' || Array.isArray((value as any).props)) return null;
+    const props = (value as any).props as Record<string, unknown>;
+    if (Object.values(props).some((entry) => typeof entry !== 'string')) return null;
+    remaining.push({ x: value.x, y: value.y, z: value.z, name: (value as any).name, props: props as Record<string, string> });
+  }
+  const remainingClear: MinecraftBuildJob['clear'] = [];
+  for (const value of data.remainingClear) {
+    if (!position(value)) return null;
+    remainingClear.push({ x: value.x, y: value.y, z: value.z });
+  }
+  const temporaryBlocks: MinecraftBuildJob['ownedTemporary'] = [];
+  for (const value of data.temporaryBlocks) {
+    if (!position(value) || typeof (value as any).name !== 'string' || !(value as any).name) return null;
+    temporaryBlocks.push({ x: value.x, y: value.y, z: value.z, name: (value as any).name });
+  }
+  return { completed: Number(data.completed), remaining, remainingClear, unloaded: Number(data.unloaded), temporaryBlocks };
 }
 
 function describeResult(r: MinecraftActionResult, label: string): string {

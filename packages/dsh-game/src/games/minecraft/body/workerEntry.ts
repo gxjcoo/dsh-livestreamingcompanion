@@ -56,6 +56,17 @@ export function createWorkerDispatcher(
         ok: false,
         error: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      if (command.action === 'execute-action') {
+        // The response carries the result; this separate lifecycle event is the cleanup barrier.
+        send({
+          type: 'event',
+          event: {
+            kind: 'action-handler-settled',
+            actionId: (command.payload as MinecraftActionInstruction).id,
+          },
+        });
+      }
     }
   };
 

@@ -22,7 +22,14 @@ export type GatherWoodReporter = (progress: GatherWoodProgress) => void;
 
 export interface GatherWoodDependencies {
   navigate?: typeof goToPosition;
+  relocate?: typeof moveAway;
+  /** Total tree-search cycles, including searches which find no reachable wood. */
+  maxAttempts?: number;
 }
+
+const DEFAULT_MAX_ATTEMPTS = 12;
+const MAX_PICKUP_ATTEMPTS = 32;
+const MAX_RELOCATION_CANDIDATES = 16;
 
 export async function gatherWood(
   bot: any,
@@ -39,9 +46,14 @@ export async function gatherWood(
   let attempt = 0;
   const failedTargets = new Set<string>();
   const navigate = dependencies.navigate ?? goToPosition;
+  const relocate = dependencies.relocate ?? moveAway;
+  const requestedAttempts = dependencies.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  const maxAttempts = Number.isFinite(requestedAttempts)
+    ? Math.max(1, Math.floor(requestedAttempts))
+    : DEFAULT_MAX_ATTEMPTS;
   report({ phase: 'inventory', message: `starting with ${before} logs; target +${num}` });
 
-  while (logsCount - before < num) {
+  while (logsCount - before < num && attempt < maxAttempts) {
     attempt += 1;
     throwIfAborted(signal);
     report({ phase: 'search', message: `attempt ${attempt}: searching within ${maxDistance} blocks` });
@@ -49,7 +61,7 @@ export async function gatherWood(
 
     if (!woodBlock) {
       report({ phase: 'retry', level: 'warn', message: `attempt ${attempt}: no log found; moving to a new search area` });
-      await moveAway(bot, 50, signal);
+      await relocate(bot, 50, signal);
       continue;
     }
 
@@ -96,7 +108,7 @@ export async function gatherWood(
     report({ phase: 'tree-scan', message: `attempt ${attempt}: found ${tree.length} nearby ${woodBlock.name} blocks` });
     if (tree.length === 0) {
       report({ phase: 'retry', level: 'warn', message: `attempt ${attempt}: target disappeared after arrival; moving to a new search area` });
-      await moveAway(bot, 15, signal);
+      await relocate(bot, 15, signal);
       continue;
     }
 
@@ -122,6 +134,12 @@ export async function gatherWood(
     report({ phase: 'verify', message: `attempt ${attempt}: inventory now ${logsCount} logs; gained ${logsCount - before}/${num}` });
   }
 
+  if (logsCount - before < num) {
+    report({
+      phase: 'retry', level: 'warn',
+      message: `stopped after ${attempt}/${maxAttempts} search cycles with ${logsCount - before}/${num} logs; returning real partial progress`,
+    });
+  }
   return {
     requested: num,
     before,
@@ -209,7 +227,7 @@ async function pickupNearbyItems(bot: any, distance: number, signal?: AbortSigna
     && bot.entity.position.distanceTo(entity.position) < distance,
   );
   let item = nearest();
-  while (item) {
+  for (let attempt = 0; item && attempt < MAX_PICKUP_ATTEMPTS; attempt += 1) {
     throwIfAborted(signal);
     await patchedGoto(bot, new goals.GoalFollow(item, 0.8), { signal });
     await sleep(500, signal);
@@ -219,23 +237,26 @@ async function pickupNearbyItems(bot: any, distance: number, signal?: AbortSigna
   }
 }
 
-async function moveAway(bot: any, distance: number, signal?: AbortSignal): Promise<boolean> {
+export async function moveAway(bot: any, distance: number, signal?: AbortSignal): Promise<boolean> {
   try {
     const position = bot.entity.position;
     let x = 0;
     let z = 0;
     let suitable = false;
-    while (!suitable) {
+    for (let attempt = 0; !suitable && attempt < MAX_RELOCATION_CANDIDATES; attempt += 1) {
       throwIfAborted(signal);
       x = Math.floor(position.x + distance * Math.random() * (Math.random() < 0.5 ? -1 : 1));
       z = Math.floor(position.z + distance * Math.random() * (Math.random() < 0.5 ? -1 : 1));
       const block = bot.blockAt(new Vec3(x, position.y - 1, z));
-      suitable = block?.name !== 'water' && block?.name !== 'lava';
+      // Unloaded columns are unknown, not safe walkable ground.
+      suitable = !!block && block.name !== 'water' && block.name !== 'lava';
     }
+    if (!suitable) return false;
     const result = await patchedGoto(bot, new goals.GoalXZ(x, z), { signal });
     await sleep(500, signal);
     return result.ok;
-  } catch {
+  } catch (error) {
+    if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
     return false;
   }
 }

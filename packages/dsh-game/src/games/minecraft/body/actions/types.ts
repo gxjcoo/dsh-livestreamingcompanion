@@ -9,7 +9,8 @@ import type {
 } from '../contracts.js';
 import type { MinecraftRawObservation, MinecraftStatus } from '../protocol.js';
 import type { PathfindResult } from '../patchedGoto.js';
-import type { BuildBlock } from '../build.js';
+import type { BuildRequest } from '../build.js';
+import type { MinecraftLightingPolicy } from '../lighting.js';
 
 export interface MinecraftConnectionOptions {
   host: string;
@@ -95,7 +96,7 @@ export interface MinecraftBodyAdapter {
   /** 周围的地形（每一列的地面高度和方块，见 terrain.ts） */
   terrain(radius: number): TerrainScan;
   /** 照图纸盖房子（见 build.ts） */
-  buildStructure(options: { label: string; blocks: BuildBlock[]; clear: { x: number; y: number; z: number }[]; signal: AbortSignal }): Promise<MinecraftActionResult>;
+  buildStructure(options: BuildRequest): Promise<MinecraftActionResult>;
   /** 种地、收庄稼、繁殖、剪羊毛（见 farming.ts） */
   farmPlot(options: { seed: string; corner: { x: number; y: number; z: number }; size: number; signal: AbortSignal }): Promise<MinecraftActionResult>;
   harvestCrops(options: { crop?: string; radius: number; replant: boolean; signal: AbortSignal }): Promise<MinecraftActionResult>;
@@ -158,6 +159,14 @@ export interface MinecraftBodyAdapter {
     block: string;
     position?: { x: number; y: number; z: number };
     face?: string;
+    signal: AbortSignal;
+  }): Promise<MinecraftActionResult>;
+  ensureLighting(options: {
+    radius: number;
+    verticalRadius: number;
+    maxTorches: number;
+    policy: MinecraftLightingPolicy;
+    protectedCells?: { x: number; y: number; z: number }[];
     signal: AbortSignal;
   }): Promise<MinecraftActionResult>;
   pickupDrops(options: { radius: number }): Promise<MinecraftActionResult>;

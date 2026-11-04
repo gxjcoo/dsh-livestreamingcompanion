@@ -38,6 +38,7 @@ export type MinecraftActionName =
   | 'use_on_block'
   | 'dig_at'
   | 'place_block'
+  | 'ensure_lighting'
   | 'break_block'
   | 'execute_blueprint'
   | 'build_structure';
@@ -57,6 +58,7 @@ export type MinecraftActionErrorCode =
   | 'cancelled'
   | 'recipe_unavailable'
   | 'inventory_desync'
+  | 'unknown'
   | 'craft_rejected'
   | 'dig_rejected'
   | 'adapter_error';
@@ -85,11 +87,20 @@ export interface MinecraftObservedEntity {
   hostile: boolean;
 }
 
+export interface MinecraftLightingSnapshot {
+  loaded: boolean;
+  blockLight: number | null;
+  skyLight: number | null;
+  canSeeSky: boolean | null;
+  sampledAt: number;
+}
+
 export interface MinecraftEnvironmentSnapshot {
   capturedAt: number;
   stale: boolean;
   connection: { connected: boolean; username?: string; host?: string; port?: number };
   world?: { dimension: string; biome?: string; timeOfDay?: number; weather?: string };
+  lighting?: MinecraftLightingSnapshot;
   body?: {
     position: { x: number; y: number; z: number };
     health: number;
@@ -129,6 +140,8 @@ export interface MinecraftWorldChange {
 export interface MinecraftActionResult {
   actionId: string;
   outcome: 'succeeded' | 'partial' | 'failed' | 'cancelled';
+  /** Whether the handler knows the terminal outcome; uncertain side effects require reconciliation. */
+  certainty?: 'certain' | 'uncertain';
   summary: string;
   durationMs: number;
   inventoryDelta: Record<string, number>;
