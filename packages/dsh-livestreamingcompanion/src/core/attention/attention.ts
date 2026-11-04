@@ -14,6 +14,7 @@
  * 这里没有时钟、没有 IO：所有方法都接收 now，方便拿录下来的直播回放测试。
  */
 
+import { isHighFanLevel } from '../live';
 import type {
   LiveChatEvent,
   LiveEvent,
@@ -344,11 +345,12 @@ export class LiveAttention {
     if (features.greeting) tags.push('打招呼');
     if (this.greeted.has(uid)) tags.push('这场已经打过招呼了：别再欢迎，也别说他是第一次来');
     else if (memory.chats === 1) tags.push('本场第一次说话');
-    // 身份只放大内容分：舰长刷「哈哈哈」也还是没话可接（有的房间几乎人人是舰长）
+    // 身份只放大内容分：高等级观众刷「哈哈哈」也还是没话可接
     const guard = event.user.guardLevel ?? 0;
     if (GUARD_TAG[guard]) { base *= 1.25; tags.push(GUARD_TAG[guard]); }
+    if (event.user.honorLevel) tags.push(`抖音荣誉等级${event.user.honorLevel}级`);
     const medal = event.user.medal?.ofThisRoom ? event.user.medal.level : 0;
-    if (medal >= 20) { base *= 1.1; tags.push(`粉丝牌${medal}级`); }
+    if (isHighFanLevel(medal, event.platform)) { base *= 1.1; tags.push(`${event.platform === 'douyin' ? '粉丝团' : '粉丝牌'}${medal}级`); }
     if (event.user.isAdmin) { base *= 1.05; tags.push('房管'); }
 
     this.chats.push({ event, at: now, text: clean.text, uid, features, base, tags });
@@ -466,8 +468,9 @@ export class LiveAttention {
   }
 
   private welcomeCandidate(heat: RoomHeat, now: number): { priority: number; build: () => TopicBody } | null {
-    // 热闹时只欢迎舰长和老粉
-    const eligible = this.enters.filter((e) => heat !== 'busy' || (e.user.guardLevel ?? 0) > 0 || (e.user.medal?.ofThisRoom && e.user.medal.level >= 20));
+    // 热闹时只欢迎大航海和各平台的高等级粉丝（B 站粉丝牌 20 级、抖音粉丝团 10 级）
+    const eligible = this.enters.filter((e) => heat !== 'busy' || (e.user.guardLevel ?? 0) > 0
+      || (e.user.medal?.ofThisRoom && isHighFanLevel(e.user.medal.level, e.user.platform)));
     if (!eligible.length || this.owner.welcomeOff) return null;
     if (now - (this.lastSaid.welcome ?? -Infinity) < (this.owner.welcomeGapMs ?? Math.max(TUNING.welcomeIntervalMs[heat], this.welcomeGapMs))) return null;
     if (now - Math.min(...eligible.map((e) => e.at)) < TUNING.welcomeGatherMs) return null;

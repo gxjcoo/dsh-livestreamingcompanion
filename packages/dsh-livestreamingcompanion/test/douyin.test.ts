@@ -59,6 +59,13 @@ function giftMessage(input: { userId: string; name: string; giftId: number; repe
   return Buffer.concat([s(1, 'WebcastGiftMessage'), field(2, 2, body)]);
 }
 
+function chatMessage(input: { userId: string; name: string; honorLevel: number; clubName: string; clubLevel: number }): Buffer {
+  const club = field(24, 2, field(1, 2, Buffer.concat([s(1, input.clubName), n(2, input.clubLevel)])));
+  const user = Buffer.concat([n(1, Number(input.userId)), s(3, input.name), n(6, input.honorLevel), club]);
+  const body = Buffer.concat([field(2, 2, user), s(3, '晚上好')]);
+  return Buffer.concat([s(1, 'WebcastChatMessage'), field(2, 2, body)]);
+}
+
 describe.runIf(hasFixtures)('douyin decode (real recordings)', () => {
   it('reads chat, enters, likes, follows and room stats from a busy room', () => {
     const { events, stats } = decodeAll('chat.jsonl');
@@ -70,6 +77,9 @@ describe.runIf(hasFixtures)('douyin decode (real recordings)', () => {
     const chats = events.filter((e) => e.kind === 'chat');
     expect(chats.every((c) => c.user.name.length > 0)).toBe(true);
     expect(chats.some((c) => c.user.masked)).toBe(true);
+    // 真实录制里能读到抖音荣誉等级；它绝不能被当成 B 站大航海
+    expect(chats.some((c) => (c.user.honorLevel ?? 0) > 0)).toBe(true);
+    expect(chats.every((c) => c.user.guardLevel === undefined)).toBe(true);
     // 在线人数是秒级的推送，取最后一个
     const online = stats.filter((x) => 'online' in x).at(-1);
     expect(online?.online).toBeGreaterThan(0);
@@ -114,6 +124,18 @@ describe('douyin framing', () => {
     expect(b).toEqual(a);
   });
 
+  it('keeps Douyin honor and fans-club levels separate from Bilibili guard levels', () => {
+    const output = decodePushFrame(frame([chatMessage({ userId: '42', name: '小明', honorLevel: 37, clubName: '鱼粉团', clubLevel: 12 })]), CTX, 1);
+    const event = output.find((o) => o.type === 'event');
+    expect(event && event.type === 'event' ? event.event.user : null).toMatchObject({
+      id: '42',
+      platform: 'douyin',
+      honorLevel: 37,
+      medal: { name: '鱼粉团', level: 12, ofThisRoom: true },
+    });
+    expect(event && event.type === 'event' ? event.event.user.guardLevel : 1).toBeUndefined();
+  });
+
   it('turns diamonds into yuan and merges a combo by user+gift+group', () => {
     const first = decodePushFrame(frame([giftMessage({ userId: '42', name: '小明', giftId: 5655, repeat: 1, group: 'g1', diamond: 5 })]), CTX, 1);
     const event = first.find((o) => o.type === 'event');
@@ -121,14 +143,16 @@ describe('douyin framing', () => {
       kind: 'gift',
       giftName: '小心心',
       count: 1,
+      diamonds: 5,
       valueYuan: 0.5,
-      user: { id: '42', name: '小明' },
+      user: { id: '42', name: '小明', platform: 'douyin' },
     });
     const second = decodePushFrame(frame([giftMessage({ userId: '42', name: '小明', giftId: 5655, repeat: 4, group: 'g1', diamond: 5 })]), CTX, 2);
     const again = second.find((o) => o.type === 'event');
     const id1 = event?.type === 'event' ? event.event.id : '';
     const id2 = again?.type === 'event' ? again.event.id : '';
     expect(id2).toBe(id1);
+    expect(again?.type === 'event' && again.event.kind === 'gift' ? again.event.diamonds : 0).toBe(20);
   });
 });
 

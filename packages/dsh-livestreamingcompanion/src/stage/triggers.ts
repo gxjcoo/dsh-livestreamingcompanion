@@ -7,7 +7,7 @@
  *   follow         关注了直播间
  *   gift.small     礼物，不到 5 元       gift.big        5 到 100 元        gift.huge   100 元以上
  *   superchat      醒目留言              superchat.big   100 元以上的醒目留言
- *   membership     上舰（开通舰长、提督、总督）
+ *   membership     平台会员（B 站上舰 / 抖音加入粉丝团）
  */
 
 import type { StageLiveEvent } from './protocol';

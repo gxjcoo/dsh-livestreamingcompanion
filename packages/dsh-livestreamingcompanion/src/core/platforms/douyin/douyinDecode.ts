@@ -76,7 +76,7 @@ function chatId(common: PbMessage | undefined, user: LiveUser, text: string): st
   return `dy:dm:${msgId || 'x'}:${digest}`;
 }
 
-/** User { 1 id, 3 nickname, 9 avatarThumb{1 url_list}, 24 fansClub, 38 displayId, 46 secUid } */
+/** User { 1 id, 3 nickname, 6 honorLevel, 9 avatarThumb{1 url_list}, 24 fansClub, 38 displayId, 46 secUid } */
 function userOf(msg: PbMessage | undefined, ctx: DouyinContext): LiveUser {
   const id = pbId(msg, 1);
   const name = pbString(msg, 3);
@@ -86,14 +86,14 @@ function userOf(msg: PbMessage | undefined, ctx: DouyinContext): LiveUser {
   const club = pbChild(pbChild(msg, 24), 1);
   const clubName = pbString(club, 1);
   const clubLevel = pbNumber(club, 2);
-  const user: LiveUser = { id, name };
+  const user: LiveUser = { id, name, platform: 'douyin' };
   if (face) user.face = face.replace(/^http:/, 'https:');
   // 抖音匿名叫「张***」、id 是 111111
   if (!id || id === '111111' || name.includes('***')) user.masked = true;
   if (clubName && clubLevel) user.medal = { name: clubName, level: clubLevel, ofThisRoom: true };
-  if (pbNumber(msg, 6) >= 0) {
-    // 6 是「等级」：不是大航海，别当粉丝牌用；留空
-  }
+  // 抖音自己的荣誉等级：独立展示，不能塞进 B 站的 guardLevel（舰长 / 提督 / 总督）
+  const honorLevel = pbNumber(msg, 6);
+  if (honorLevel > 0) user.honorLevel = honorLevel;
   void ctx;
   return user;
 }
@@ -128,6 +128,7 @@ function gift(body: PbMessage, ctx: DouyinContext, now: number): LiveEvent | nul
   const group = pbId(body, 11) || pbString(body, 11) || pbId(body, 16);
   const user = userOf(pbChild(body, 7), ctx);
   const combo = group ? `${user.id}:${giftId}:${group}` : '';
+  const diamonds = unit * count;
   return {
     id: combo ? `dy:gift:${combo}` : nextId('gift'),
     platform: 'douyin',
@@ -136,8 +137,9 @@ function gift(body: PbMessage, ctx: DouyinContext, now: number): LiveEvent | nul
     user,
     giftName: name,
     count,
-    // 抖币 → 元：1 元 = 10 抖币
-    valueYuan: Math.round(((unit * count) / 10) * 100) / 100,
+    // 抖币 → 元：1 元 = 10 抖币；舞台同时保留抖音原生的抖币数（价格未知时不谎称 0 抖币）
+    ...(diamonds > 0 ? { diamonds } : {}),
+    valueYuan: Math.round((diamonds / 10) * 100) / 100,
   };
 }
 

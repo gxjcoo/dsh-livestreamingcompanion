@@ -1066,20 +1066,21 @@ function stageUser(user: LiveUser): StageUser {
     name: cleanName(user.name),
     ...(user.face ? { face: user.face } : {}),
     ...(user.guardLevel ? { guard: user.guardLevel } : {}),
+    ...(user.honorLevel ? { honor: user.honorLevel } : {}),
     ...(user.medal?.ofThisRoom ? { medal: { name: cleanName(user.medal.name), level: user.medal.level } } : {}),
     ...(user.isAdmin ? { admin: true } : {}),
   };
 }
 
 /** 直播事件 → 舞台显示用（清洗过的名字和文字；点赞不上舞台） */
-function toStage(event: LiveEvent): StageLiveEvent | null {
-  const user = stageUser(event.user);
+export function toStage(event: LiveEvent): StageLiveEvent | null {
+  const base = { id: event.id, user: stageUser(event.user), platform: event.platform };
   switch (event.kind) {
-    case 'chat': return { kind: 'chat', id: event.id, user, text: cleanText(event.text), ...(event.stickerUrl ? { sticker: event.stickerUrl } : {}) };
-    case 'gift': return { kind: 'gift', id: event.id, user, gift: cleanName(event.giftName), count: event.count, yuan: event.valueYuan };
-    case 'superchat': return { kind: 'superchat', id: event.id, user, text: cleanText(event.text), yuan: event.valueYuan };
-    case 'membership': return { kind: 'membership', id: event.id, user, level: cleanName(event.levelName), count: event.count };
-    case 'enter': case 'follow': return { kind: event.kind, id: event.id, user };
+    case 'chat': return { ...base, kind: 'chat', text: cleanText(event.text), ...(event.stickerUrl ? { sticker: event.stickerUrl } : {}) };
+    case 'gift': return { ...base, kind: 'gift', gift: cleanName(event.giftName), count: event.count, yuan: event.valueYuan, ...(event.diamonds !== undefined ? { diamonds: event.diamonds } : {}) };
+    case 'superchat': return { ...base, kind: 'superchat', text: cleanText(event.text), yuan: event.valueYuan };
+    case 'membership': return { ...base, kind: 'membership', level: cleanName(event.levelName), count: event.count };
+    case 'enter': case 'follow': return { ...base, kind: event.kind };
     default: return null;
   }
 }

@@ -5,17 +5,29 @@
 
 export type LivePlatform = 'bilibili' | 'douyin';
 
+/**
+ * 注意力层说的「高等级粉丝」：B 站粉丝牌到 40 级、抖音粉丝团到 20 级，各自取中点。
+ * 只用于决定回应优先级，不把两个平台的等级数字互相换算。
+ */
+export function isHighFanLevel(level: number, platform: LivePlatform = 'bilibili'): boolean {
+  return level >= (platform === 'douyin' ? 10 : 20);
+}
+
 export interface LiveUser {
   /** 平台内的用户 id；平台隐藏身份时为空串 */
   id: string;
   name: string;
+  /** 保留用户自己的平台：欢迎、关注等聚合话题里不再带着原事件 */
+  platform?: LivePlatform;
   face?: string;
   /** 平台把名字打了码（如 B 站未登录时的「小***」） */
   masked?: boolean;
   /** 粉丝牌：ofThisRoom 表示是本直播间主播的牌子 */
   medal?: { name: string; level: number; ofThisRoom: boolean };
-  /** 大航海等级：1 总督、2 提督、3 舰长；0/缺省为无 */
+  /** 大航海等级：1 总督、2 提督、3 舰长；0/缺省为无（仅 B 站） */
   guardLevel?: number;
+  /** 抖音荣誉等级；不能套进 B 站的大航海等级 */
+  honorLevel?: number;
   /** 本房间房管 */
   isAdmin?: boolean;
 }
@@ -46,6 +58,8 @@ export interface LiveGiftEvent extends LiveEventBase {
   count: number;
   /** 折合人民币（元）；免费礼物为 0 */
   valueYuan: number;
+  /** 这次连击累计消耗的抖币（仅抖音；其他平台不填） */
+  diamonds?: number;
 }
 
 export interface LiveSuperChatEvent extends LiveEventBase {
@@ -56,7 +70,7 @@ export interface LiveSuperChatEvent extends LiveEventBase {
 
 export interface LiveMembershipEvent extends LiveEventBase {
   kind: 'membership';
-  /** 平台的会员等级名（舰长 / 提督 / 总督） */
+  /** 平台的会员等级名（B 站：舰长 / 提督 / 总督；抖音：粉丝团） */
   levelName: string;
   level: number;
   count: number;

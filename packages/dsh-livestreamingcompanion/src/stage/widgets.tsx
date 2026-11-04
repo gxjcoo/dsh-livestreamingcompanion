@@ -9,7 +9,7 @@ import { assetUrl, dropAlert, energy, riceOf, getState, litChars, mediaUrl, prev
 import { giftTier } from './triggers';
 
 export function useStage(): StageState {
-  return useSyncExternalStore(subscribe, getState);
+  return useSyncExternalStore(subscribe, getState, getState);
 }
 
 /** 值变成空以后再留 ms 毫秒（给退场动画）：返回 [还显示的值, 是不是在退场] */
@@ -560,16 +560,17 @@ export function Subtitle({ options }: { options?: Record<string, unknown> }) {
 
 const GUARD = ['', '总督', '提督', '舰长'];
 
-/** 粉丝牌按等级换色（照 B 站：越高越暖） */
+/** 粉丝徽章按等级换色（各平台保留自己的等级数值，互不换算） */
 function medalTier(level: number): number {
   return Math.min(6, Math.max(1, Math.ceil(level / 4)));
 }
 
-function Badge({ user }: { user: StageUser }) {
+export function Badge({ user, platform }: { user: StageUser; platform?: StageLiveEvent['platform'] }) {
   return (
     <>
       {user.guard ? <span className={`ls-badge ls-guard-${user.guard}`}>{GUARD[user.guard]}</span> : null}
-      {user.medal ? <span className={`ls-badge ls-medal ls-medal-t${medalTier(user.medal.level)}`}><span>{user.medal.name}</span><b>{user.medal.level}</b></span> : null}
+      {user.honor ? <span className="ls-badge ls-douyin-level" title={`抖音荣誉等级 ${user.honor} 级`}><span>荣誉</span><b>{user.honor}</b></span> : null}
+      {user.medal ? <span className={`ls-badge ls-medal ls-medal-t${medalTier(user.medal.level)}${platform === 'douyin' ? ' ls-medal-douyin' : ''}`}><span>{user.medal.name}</span><b>{user.medal.level}</b></span> : null}
       {user.admin ? <span className="ls-badge ls-admin">房管</span> : null}
     </>
   );
@@ -605,7 +606,7 @@ export function Chat({ options }: { options?: Record<string, unknown> }) {
             <div key={row.id} className={`ls-chat-row${focused ? ' ls-focused' : ''}${user.guard ? ` ls-row-guard ls-row-guard-${user.guard}` : ''}`}>
               <Avatar user={user} />
               <div className="ls-chat-body">
-                <div className="ls-chat-name"><Badge user={user} /><span className="ls-name">{user.name}</span>{focused && <em className="ls-replying"><Voice />正在回你</em>}</div>
+                <div className="ls-chat-name"><Badge user={user} platform={row.event.platform} /><span className="ls-name">{user.name}</span>{focused && <em className="ls-replying"><Voice />正在回你</em>}</div>
                 {row.event.sticker ? <img className="ls-sticker" src={row.event.sticker} referrerPolicy="no-referrer" alt={row.event.text} /> : <div className="ls-chat-text">{row.event.text}</div>}
               </div>
             </div>
@@ -681,7 +682,7 @@ function eventText(e: StageLiveEvent): string {
   switch (e.kind) {
     case 'chat': case 'superchat': return e.text;
     case 'gift': return `送出 ${e.gift} ×${e.count}`;
-    case 'membership': return `开通了${e.level}`;
+    case 'membership': return e.platform === 'douyin' ? `加入了${e.level}` : `开通了${e.level}`;
     case 'follow': return '关注了直播间';
     case 'enter': return '进入直播间';
   }
@@ -694,7 +695,7 @@ function ReplyCard({ item, i }: { item: ReplyItem; i: number }) {
     <div className={`ls-reply-card ls-reply-${e.kind}${e.kind === 'superchat' ? ` ls-sc-${scTier(e.yuan)}` : ''}`} style={{ '--i': i } as React.CSSProperties}>
       <Avatar user={e.user} />
       <div className="ls-reply-body">
-        <div className="ls-reply-name"><Badge user={e.user} /><span className="ls-name">{e.user.name}</span>{e.kind === 'superchat' && <b className="ls-reply-price">¥{e.yuan}</b>}</div>
+        <div className="ls-reply-name"><Badge user={e.user} platform={e.platform} /><span className="ls-name">{e.user.name}</span>{e.kind === 'superchat' && <b className="ls-reply-price">¥{e.yuan}</b>}</div>
         {e.kind === 'chat' && e.sticker
           ? <img className="ls-sticker" src={e.sticker} referrerPolicy="no-referrer" alt={e.text} />
           : <p className={said ? undefined : 'ls-reply-act'}>{eventText(e)}</p>}
@@ -745,7 +746,7 @@ function alertTtl(e: Alert['event']): number {
   }
 }
 
-function AlertCard({ alert }: { alert: Alert }) {
+export function AlertCard({ alert }: { alert: Alert }) {
   const e = alert.event;
   const giftArt = useArt('gift');
   const waveArt = useArt('wave');
@@ -777,10 +778,14 @@ function AlertCard({ alert }: { alert: Alert }) {
       // 小（一行带过）、大（金边、光点、举着礼物的她）、超大（再加光芒）
       const size = giftTier(e.yuan);
       return (
-        <div className={`ls-alert ls-gift ls-gift-${size}${size !== 'small' ? ' ls-big' : ''}${out}`}>
+        <div className={`ls-alert ls-gift ls-gift-${size}${size !== 'small' ? ' ls-big' : ''}${e.platform === 'douyin' ? ' ls-gift-douyin' : ''}${out}`}>
           {size === 'huge' && <i className="ls-rays" />}
           <Avatar user={e.user} />
-          <div className="ls-gift-text"><b>{e.user.name}</b><span>送出 <strong>{e.gift}</strong></span></div>
+          <div className="ls-gift-text">
+            <b>{e.user.name}</b>
+            <span>送出 <strong>{e.gift}</strong></span>
+            {e.diamonds !== undefined && <small className="ls-gift-diamonds">共 {e.diamonds} 抖币</small>}
+          </div>
           <span className="ls-gift-icon"><GiftIcon /></span>
           <em className="ls-combo" key={e.count}>×{e.count}</em>
           {size !== 'small' && giftArt && <ArtImg className="ls-alert-art" src={giftArt} />}
@@ -788,7 +793,23 @@ function AlertCard({ alert }: { alert: Alert }) {
         </div>
       );
     }
-    case 'membership':
+    case 'membership': {
+      if (e.platform === 'douyin') {
+        return (
+          <div className={`ls-alert ls-fansclub ls-big${out}`}>
+            <i className="ls-rays" />
+            <span className="ls-fansclub-icon"><HeartIcon /></span>
+            <div className="ls-fansclub-text">
+              <small>粉丝团</small>
+              <b>{e.user.name}</b>
+              <span>加入了{e.level}{e.count > 1 ? ` ×${e.count}` : ''}</span>
+            </div>
+            <Avatar user={e.user} />
+            {giftArt && <ArtImg className="ls-alert-art" src={giftArt} />}
+            <Sparks n={16} />
+          </div>
+        );
+      }
       return (
         <div className={`ls-alert ls-guard ls-big ls-guard-lv${guardLevel(e.level)}${out}`}>
           <i className="ls-rays" />
@@ -803,6 +824,7 @@ function AlertCard({ alert }: { alert: Alert }) {
           <Sparks n={16} />
         </div>
       );
+    }
     case 'follow':
       return <div className={`ls-alert ls-follow${out}`}><span className="ls-follow-icon"><HeartIcon /></span><span><b>{e.user.name}</b> 关注了直播间</span></div>;
     case 'enter':
@@ -810,7 +832,7 @@ function AlertCard({ alert }: { alert: Alert }) {
       return (
         <div className={`ls-alert ls-enter${e.user.guard ? ` ls-enter-guard ls-enter-guard-${e.user.guard}` : ''}${waveArt ? ' ls-has-art' : ''}${out}`}>
           {waveArt && <ArtImg className="ls-enter-art" src={waveArt} />}
-          {e.user.guard ? <Badge user={e.user} /> : null}
+          {e.user.guard || e.user.honor || e.user.medal ? <Badge user={e.user} platform={e.platform} /> : null}
           <span>欢迎 <b>{e.user.name}</b> 进入直播间</span>
         </div>
       );

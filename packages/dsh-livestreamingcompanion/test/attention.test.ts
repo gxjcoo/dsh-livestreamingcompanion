@@ -137,6 +137,23 @@ describe('attention rules', () => {
     expect(a.next(5000)?.kind).toBe('thanks');
   });
 
+  it('uses Douyin fans-club levels and terminology instead of the Bilibili medal threshold', () => {
+    const a = new LiveAttention(0);
+    const event = chat('dy1', '1', '晚上好，今天玩什么？', {
+      platform: 'douyin',
+      honorLevel: 37,
+      medal: { name: '鱼粉团', level: 12, ofThisRoom: true },
+    });
+    a.observe({ ...event, platform: 'douyin' }, false, 0);
+    const topic = a.next(100);
+    expect(topic?.kind).toBe('chat');
+    const tags = topic?.kind === 'chat' ? topic.picks[0].tags : [];
+    expect(tags).toContain('粉丝团12级');
+    expect(tags).toContain('抖音荣誉等级37级');
+    expect(tags.join('/')).not.toContain('粉丝牌');
+    expect(tags.join('/')).not.toContain('舰长');
+  });
+
   it('answers a question over small talk and does not answer the same viewer twice in a row', () => {
     const a = new LiveAttention(0);
     a.observe(chat('c1', '1', '在吗在吗'), false, 0);

@@ -17,7 +17,7 @@ export interface ChatPick {
   event: LiveChatEvent;
   /** 同一个人连发的几条合在一起 */
   text: string;
-  /** 给 LLM 看的标签：问题 / 点名 / 舰长 / 新观众 / 接她的话 … */
+  /** 给 LLM 看的标签：问题 / 点名 / 平台身份 / 新观众 / 接她的话 … */
   tags: string[];
   score: number;
 }
@@ -25,7 +25,7 @@ export interface ChatPick {
 export type TopicBody =
   /** 醒目留言：单独念、单独回 */
   | { kind: 'superchat'; event: LiveSuperChatEvent }
-  /** 上舰与大额礼物：逐个点名感谢 */
+  /** 平台会员（B 站上舰、抖音粉丝团）与大额礼物：逐个点名感谢 */
   | { kind: 'thanks'; events: Array<LiveGiftEvent | LiveMembershipEvent> }
   /** 小礼物：攒一批一起谢；more 是没点名的人数 */
   | { kind: 'gifts'; events: LiveGiftEvent[]; more: number }

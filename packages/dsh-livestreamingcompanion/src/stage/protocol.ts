@@ -7,6 +7,8 @@
  * POST /media?id=…&state=playing|ended|error&at=<秒>&token=…。
  */
 
+import type { LivePlatform } from '../core/live';
+
 export const STAGE_PROTOCOL = 1;
 
 /** 角色包清单（assets/characters/<id>/character.json） */
@@ -163,17 +165,27 @@ export interface StageUser {
   id: string;
   name: string;
   face?: string;
+  /** B 站大航海：1 总督、2 提督、3 舰长 */
   guard?: number;
+  /** 抖音荣誉等级（不是大航海） */
+  honor?: number;
   medal?: { name: string; level: number };
   admin?: boolean;
 }
 
+interface StageLiveBase {
+  id: string;
+  user: StageUser;
+  /** 缺省按 B 站兼容旧版身体；新版每条都明确带平台 */
+  platform?: LivePlatform;
+}
+
 export type StageLiveEvent =
-  | { kind: 'chat'; id: string; user: StageUser; text: string; sticker?: string }
-  | { kind: 'gift'; id: string; user: StageUser; gift: string; count: number; yuan: number }
-  | { kind: 'superchat'; id: string; user: StageUser; text: string; yuan: number }
-  | { kind: 'membership'; id: string; user: StageUser; level: string; count: number }
-  | { kind: 'enter' | 'follow'; id: string; user: StageUser };
+  | (StageLiveBase & { kind: 'chat'; text: string; sticker?: string })
+  | (StageLiveBase & { kind: 'gift'; gift: string; count: number; yuan: number; diamonds?: number })
+  | (StageLiveBase & { kind: 'superchat'; text: string; yuan: number })
+  | (StageLiveBase & { kind: 'membership'; level: string; count: number })
+  | (StageLiveBase & { kind: 'enter' | 'follow' });
 
 /** 大脑现在在干什么：舞台上「正在想…」的提示用 */
 export type BrainState = 'off' | 'listening' | 'thinking' | 'speaking' | 'away';

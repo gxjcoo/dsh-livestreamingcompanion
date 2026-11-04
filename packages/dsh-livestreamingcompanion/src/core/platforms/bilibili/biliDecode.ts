@@ -64,7 +64,7 @@ function makeUser(ctx: BiliRoomContext, fields: {
 }): LiveUser {
   const id = fields.id && String(fields.id) !== '0' ? String(fields.id) : '';
   const name = String(fields.name ?? '');
-  const user: LiveUser = { id, name };
+  const user: LiveUser = { id, name, platform: 'bilibili' };
   if (typeof fields.face === 'string' && fields.face) user.face = fields.face;
   if (isMasked(id, name)) user.masked = true;
   const medal = medalOf(ctx, fields.medalName, fields.medalLevel ?? 0, String(fields.medalOwner ?? ''));
