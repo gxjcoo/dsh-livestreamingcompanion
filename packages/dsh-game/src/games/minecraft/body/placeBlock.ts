@@ -156,20 +156,35 @@ async function tryPlaceBlock(
   faceVec: Vec3,
   signal?: AbortSignal,
 ): Promise<void> {
-  await current.equip(item, 'hand')
-  await current.lookAt(buildOffBlock.position)
-  // 对着能右键打开的方块放：和玩家一样蹲着放，不然打开的是它的界面
-  const sneak = isInteractive(buildOffBlock)
-  if (sneak) {
-    current.setControlState('sneak', true)
-    await sleep(150, signal)
-  }
+  // 自动进食的插件会在中间把食物换回手上：她刚吃过西瓜去封顶，换好的土又被换成西瓜片，
+  // 服务器就回「Server refused to place melon_slice」。放置这一小会儿先把它停掉
+  const autoEat = current.autoEat
+  const eatWasOn = !!autoEat?.enabled
+  if (eatWasOn) autoEat.disableAuto()
   try {
-    await current.placeBlock(buildOffBlock, faceVec)
+    await current.equip(item, 'hand')
+    if (current.heldItem?.name && current.heldItem.name !== item.name) {
+      await current.equip(item, 'hand')
+      if (current.heldItem?.name !== item.name) {
+        throw new Error(`cannot hold ${item.name} to place it (hand has ${current.heldItem?.name ?? 'nothing'})`)
+      }
+    }
+    await current.lookAt(buildOffBlock.position)
+    // 对着能右键打开的方块放：和玩家一样蹲着放，不然打开的是它的界面
+    const sneak = isInteractive(buildOffBlock)
+    if (sneak) {
+      current.setControlState('sneak', true)
+      await sleep(150, signal)
+    }
+    try {
+      await current.placeBlock(buildOffBlock, faceVec)
+    } finally {
+      if (sneak) current.setControlState('sneak', false)
+    }
+    await sleep(200, signal)
   } finally {
-    if (sneak) current.setControlState('sneak', false)
+    if (eatWasOn) autoEat.enableAuto()
   }
-  await sleep(200, signal)
 }
 
 function distance(left: any, right: any): number {

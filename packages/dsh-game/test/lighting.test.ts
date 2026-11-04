@@ -312,6 +312,63 @@ describe('bounded lighting execution', () => {
     });
   });
 
+  it('accepts a torch that really is at the target even when its light reading never updates', async () => {
+    // 真实服务器上 block.light 经常不跟着刷新：以前因此把已经插好的火把判成失败，白扔一个
+    const candidate: TorchCandidate = {
+      target,
+      support: { x: 0, y: 63, z: 0 },
+      kind: 'floor',
+      face: 'up',
+      expectedName: 'torch',
+      expectedFacing: 'up',
+      blockLight: 0,
+      distance: 0,
+    };
+    const { bot, set } = fakeWorld([
+      [target, air()],
+      [{ x: 0, y: 63, z: 0 }, stone()],
+    ]);
+    const verified = await waitForTorch(bot, candidate, modernSpawnPolicy, {
+      polls: 2,
+      intervalMs: 0,
+      sleep: async () => {
+        set(target, block('torch', 0, 0, { transparent: true, boundingBox: 'empty', light: 0 }));
+      },
+    });
+    expect(verified.ok).toBe(true);
+  });
+
+  it('skips a cell that will not take a torch and lights the next one', async () => {
+    const first = { x: 0, y: 64, z: 0 };
+    const second = { x: 1, y: 64, z: 0 };
+    const { bot, set } = fakeWorld([
+      [first, air()],
+      [{ x: 0, y: 63, z: 0 }, stone()],
+      [second, air()],
+      [{ x: 1, y: 63, z: 0 }, stone()],
+    ]);
+    bot.inventory.items = () => [{ name: 'torch', count: 4 }];
+    let calls = 0;
+    const result = await ensureLighting(bot, {
+      ...modernSpawnPolicy,
+      radius: 1,
+      verticalRadius: 0,
+      maxTorches: 2,
+      verificationPolls: 1,
+      verificationIntervalMs: 0,
+      signal: new AbortController().signal,
+      place: async (_item: any, candidate: any) => {
+        calls += 1;
+        if (calls === 1) throw new Error('no block to place against'); // 这个格子插不上
+        set(candidate.target, block('torch', 14, 0, { transparent: true, boundingBox: 'empty' }));
+      },
+    });
+    expect(calls).toBeGreaterThanOrEqual(2);
+    // 第一个格子插不上不该让整次照明失败：继续试下一个，最后至少插上一个
+    expect(result.outcome).not.toBe('failed');
+    expect(result.worldChanges?.some((change) => change.kind === 'block_placed')).toBe(true);
+  });
+
   it('uses an available torch and rescans before reporting success', async () => {
     const { bot, set } = fakeWorld([
       [target, air()],

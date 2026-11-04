@@ -275,7 +275,8 @@ export function inspectTorchTarget(bot: any, candidate: TorchCandidate): {
   const properties = block.getProperties?.() ?? {};
   const actualFacing = properties.facing;
   const positionMatches = !block.position || samePosition(block.position, candidate.target);
-  const facingMatches = candidate.kind === 'floor' || actualFacing === candidate.expectedFacing;
+  // 朝向读不到时（不同版本的属性名不一样：facing / attachment）不要判死，位置和方块名对上就算
+  const facingMatches = candidate.kind === 'floor' || actualFacing === undefined || actualFacing === candidate.expectedFacing;
   return {
     loaded: true,
     matches: block.name === candidate.expectedName && positionMatches && facingMatches,
@@ -303,17 +304,16 @@ export async function waitForTorch(
   const intervalMs = boundedInteger(options.intervalMs ?? 250, 0, 2_000);
   const sleep = options.sleep ?? delay;
   let last = inspectTorchTarget(bot, candidate);
+  // 只要精确位置真的出现了火把就算插上了：block.light 在真实服务器上经常不跟客户端刷新
+  // （以前要求方块光读数上升，结果 20 个火把插下去、每次都被判失败，白扔一个火把）
   for (let attempt = 0; attempt < polls; attempt += 1) {
     throwIfAborted(options.signal);
     last = inspectTorchTarget(bot, candidate);
-    if (last.matches) {
-      const sample = readBlockLighting(last.block);
-      const lightUpdated = sample.blockLight !== null && sample.blockLight > candidate.blockLight;
-      if (lightUpdated && needsLighting(sample, context) === false) return { ok: true, block: last.block };
-    }
+    if (last.matches) return { ok: true, block: last.block };
     if (attempt + 1 < polls) await sleep(intervalMs, options.signal);
   }
   const details = {
+    policy: context.policy,
     position: candidate.target,
     expectedName: candidate.expectedName,
     expectedFacing: candidate.expectedFacing,
@@ -323,8 +323,7 @@ export async function waitForTorch(
     polls,
   };
   if (!last.loaded) return { ok: false, code: 'unknown', reason: 'target_unloaded', details };
-  if (!last.matches) return { ok: false, code: 'blocked', reason: 'exact_target_mismatch', details };
-  return { ok: false, code: 'timeout', reason: 'light_update_timeout', details };
+  return { ok: false, code: 'blocked', reason: 'exact_target_mismatch', details };
 }
 
 /** Run a bounded local scan/place loop. Crafting and resupply intentionally stay upstream. */
@@ -338,6 +337,11 @@ export async function ensureLighting(
   const before = inventoryCounts(bot);
   const worldChanges: MinecraftActionResult['worldChanges'] = [];
   let placed = 0;
+  /** 这一轮插不进去的格子：换下一个，别因为一个格子（被占、朝向对不上）整次照明都失败 */
+  const failedTargets = new Set<string>();
+  const cellKey = (p: LightingPosition) => `${p.x},${p.y},${p.z}`;
+  let failed = 0;
+  let lastFailure: { code: MinecraftActionErrorCode; reason: string; details: Record<string, unknown> } | null = null;
 
   const complete = (scan: TorchScanResult): MinecraftActionResult => ({
     actionId: '',
@@ -400,13 +404,16 @@ export async function ensureLighting(
     });
     if (scan.darkPositions.length === 0 && scan.unknownPositions.length === 0) return complete(scan);
     if (placed >= options.maxTorches) return fail('blocked', 'placement_limit', scan);
-    if (scan.candidates.length === 0) {
+    // 失败格子的上限：换几个位置试，别在一个插不上的格子上无限重试
+    if (failed >= options.maxTorches * 2) return fail('blocked', 'placement_limit', scan);
+    const candidate = scan.candidates.find((c) => !failedTargets.has(cellKey(c.target)));
+    if (!candidate) {
+      if (lastFailure) return fail(lastFailure.code, lastFailure.reason, scan, lastFailure.details);
       if (scan.unknownPositions.length > 0) return fail('unknown', 'unloaded_area', scan);
       if (scan.protectedPositions.length > 0) return fail('blocked', 'protected_cells', scan);
+      if (scan.candidates.length > 0) return fail('blocked', 'placement_failed', scan);
       return fail('blocked', 'no_valid_support', scan);
     }
-
-    const candidate = scan.candidates[0];
     const item = bot.inventory?.items?.().find((entry: any) => entry.name === 'torch');
     if (!item) {
       return fail('missing_item', 'torch_missing', scan, {
@@ -443,11 +450,26 @@ export async function ensureLighting(
     }
 
     const actionError = placementError instanceof LightingActionError ? placementError : undefined;
-    return fail(actionError?.code ?? verified.code, actionError ? 'place_failed' : verified.reason, scan, {
-      ...verified.details,
-      ...(actionError?.details ?? {}),
-      ...(placementError ? { originalError: errorMessage(placementError) } : {}),
-    });
+    // 走不过去（路找不到、卡住、超时）不是这个格子的问题：换格子也只是再卡一遍，直接收手，
+    // 别把二十秒全耗在原地打转（以前是格子问题才该换下一个）
+    const navigational = actionError && (actionError.code === 'path_unreachable' || actionError.code === 'timeout'
+      || actionError.details.navigationReason !== undefined);
+    if (actionError && navigational) {
+      return fail(actionError.code, 'place_failed', scan, { ...verified.details, ...actionError.details });
+    }
+    // 只是这个格子插不上（方块被占、支撑没了、服务器没接受）：记下来换下一个，别让整次照明失败
+    failedTargets.add(cellKey(candidate.target));
+    failed += 1;
+    lastFailure = {
+      code: actionError?.code ?? verified.code,
+      reason: placementError ? 'place_failed' : verified.reason,
+      details: {
+        ...verified.details,
+        ...(actionError?.details ?? {}),
+        ...(placementError ? { originalError: errorMessage(placementError) } : {}),
+      },
+    };
+    continue;
   }
 }
 

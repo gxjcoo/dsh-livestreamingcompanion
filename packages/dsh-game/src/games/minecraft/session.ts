@@ -269,6 +269,8 @@ export class MinecraftSession implements GameSession {
   private poller: NodeJS.Timeout | null = null;
   private lastHealth: number | null = null;
   private lastPhase: string | null = null;
+  /** 上一次提醒「太暗又没火把」的时间：按位置记会随走路每格重报一次，这里是整局限流 */
+  private lastDarkNoticeAt = 0;
   private seenHostiles = new Set<string>();
   private nudged = false;
   private firstMoment = true;
@@ -1464,8 +1466,10 @@ export class MinecraftSession implements GameSession {
       || this.queue.some((item) => item.bodyAction === 'craft_item' && item.args.item === 'torch');
     const torches = body.inventory.torch ?? body.inventory['minecraft:torch'] ?? 0;
     if (torches < 1) {
-      if (!torchSupplyRunning) {
-        this.push('当前位置太暗，而且背包里没有火把。需要先通过结构化计划补给火把，或选择安全撤退；不会摸黑盲目续作。', true);
+      // 整局限流：以前按位置记，走一格就重报一次，一个时刻里能塞进四句一样的话
+      if (!torchSupplyRunning && now - this.lastDarkNoticeAt > 60_000) {
+        this.lastDarkNoticeAt = now;
+        this.push('当前位置太暗，而且背包里没有火把：别摸黑干活——先躲起来等天亮（hide），或者回去捡回掉落的火把。', true);
       }
       this.rememberLightingMaintenance(key, { attempts: 0, nextAt: now + 60_000, exhaustionNotified: false });
       return;
@@ -1889,12 +1893,18 @@ export class MinecraftSession implements GameSession {
     const health = s?.body?.health;
     if (typeof health === 'number' && this.lastHealth !== null && health < this.lastHealth - 0.5) {
       const near = hostiles(s).filter((e) => e.distance <= 8).map(fmtEntity);
-      this.push(`挨打了：血量 ${fmt1(this.lastHealth)} → ${fmt1(health)}/20${near.length ? `，附近有 ${near.join('、')}` : ''}`, health <= 10);
+      // 饥饿掉到 0 时每 4 秒掉一颗血：那不是挨打，别让她以为被怪贴脸了去打怪
+      const starving = typeof s?.body?.food === 'number' && s.body.food <= 0.5;
+      if (starving && near.length === 0) {
+        this.push(`饿到掉血：血量 ${fmt1(this.lastHealth)} → ${fmt1(health)}/20（饥饿 0/20，先吃东西，别管别的）`, true);
+      } else {
+        this.push(`挨打了：血量 ${fmt1(this.lastHealth)} → ${fmt1(health)}/20${near.length ? `，附近有 ${near.join('、')}` : ''}`, health <= 10);
+      }
     }
     if (typeof health === 'number') this.lastHealth = health;
     const phase = phaseOf(s?.world?.timeOfDay);
     if (phase && this.lastPhase && phase !== this.lastPhase) {
-      if (phase === '夜晚') this.push('天黑了，外面会刷出怪物。', false);
+      if (phase === '夜晚') this.push(`天黑了，外面会刷出怪物。${this.nightHint()}`, false);
       if (phase === '白天') this.push('天亮了。', false);
     }
     if (phase) this.lastPhase = phase;
@@ -2331,6 +2341,15 @@ export class MinecraftSession implements GameSession {
     return String(this.snapshot?.world?.dimension ?? 'overworld').replace('minecraft:', '');
   }
 
+  /** 天黑了该干什么：有床就睡，能凑床就做床，都没有才躲起来 */
+  private nightHint(): string {
+    const inv = this.snapshot?.body?.inventory ?? {};
+    const sum = (suffix: string) => Object.entries(inv).filter(([k]) => k.endsWith(suffix)).reduce((total, [, n]) => total + n, 0);
+    if (sum('_bed') > 0) return '背包里有床：拿在手上对着地面右键就能睡（sleep），睡一觉直接到天亮。';
+    if (sum('_wool') >= 3 && sum('_planks') >= 3) return '你有羊毛和木板：先合成床（craft_item bed）再 sleep，比躲一夜划算。';
+    return '没有床：先进屋、或者挖个封闭的洞躲着（hide），别在黑地里待着。';
+  }
+
   private moment(reason: string): Moment {
     const s = this.snapshot;
     const lines = this.lines;
@@ -2341,7 +2360,7 @@ export class MinecraftSession implements GameSession {
       const step = this.plan.steps.find((candidate) => candidate.status === 'running')
         ?? this.plan.steps.find((candidate) => candidate.status !== 'done');
       const failure = step?.lastFailure ? `；最近失败 ${step.lastFailure.code}/${step.lastFailure.disposition}` : '';
-      notes.push(`结构化计划 ${this.plan.id}：${this.plan.status}，${this.planMode} 模式${step ? `；当前步骤 ${step.id}/${step.skill}/${step.status}${failure}` : '；没有待执行步骤'}。`);
+      notes.push(`结构化计划 ${this.plan.id}：${this.plan.status}，${this.planMode} 模式${step ? `；当前步骤 ${step.id}/${step.skill}/${step.status}${failure}` : '；没有待执行步骤（用 plan 重新提交，比如 ensure_food / prepare_for_night / ensure_lighting）'}。`);
     }
     if (s?.lighting) notes.push(`当前位置光照：方块光 ${s.lighting.blockLight ?? '未知'}/15，天空光 ${s.lighting.skyLight ?? '未知'}/15，${s.lighting.loaded ? '区块已加载' : '区块未加载（不能当成黑暗）'}。`);
     if (this.running) {
@@ -2351,6 +2370,11 @@ export class MinecraftSession implements GameSession {
       notes.push('身体现在空着。');
     }
     if (this.queue.length) notes.push(`排着队：${this.queue.map((q) => q.label).join(' → ')}`);
+    // 饿到快掉血、背包里又没吃的：先把吃的解决，别继续挖矿
+    const food = s?.body?.food;
+    if (typeof food === 'number' && food <= 6 && !hasFood(s?.body?.inventory)) {
+      notes.push(`你很饿（饥饿 ${Math.round(food)}/20），背包里没有能直接吃的东西：先解决吃的（ensure_food，或者打猎 / 摘西瓜 / 钓鱼），再干别的。`);
+    }
     if (s?.body) notes.push(`背包：${formatInventory(s.body.inventory)}`);
     if (s?.body?.inWater) notes.push('你泡在水里（look 看看周围哪里是陆地）。');
     const near = (s?.nearby.entities ?? []).filter((e) => e.distance <= 24).slice(0, 8).map(fmtEntity);
@@ -2471,6 +2495,13 @@ function formatInventory(inv: Record<string, number> | undefined): string {
   const entries = Object.entries(inv ?? {}).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]);
   if (!entries.length) return '空的';
   return entries.slice(0, 24).map(([k, n]) => `${k}×${n}`).join('、') + (entries.length > 24 ? ` 等 ${entries.length} 种` : '');
+}
+
+/** 背包里有没有能直接吃的东西（粗判，只用来决定「先找吃的」这个提醒要不要发） */
+const FOOD_ITEM = /^(cooked_|beef$|porkchop$|chicken$|mutton$|rabbit$|cod$|salmon$|bread$|baked_potato$|potato$|carrot$|apple$|melon_slice$|pumpkin_pie$|cookie$|dried_kelp$|sweet_berries$|glow_berries$|beetroot$|beetroot_soup$|mushroom_stew$|rabbit_stew$|golden_apple$|enchanted_golden_apple$)/;
+
+function hasFood(inv: Record<string, number> | undefined): boolean {
+  return Object.entries(inv ?? {}).some(([name, count]) => count > 0 && FOOD_ITEM.test(name));
 }
 
 function hostiles(s: MinecraftEnvironmentSnapshot | null): MinecraftObservedEntity[] {
