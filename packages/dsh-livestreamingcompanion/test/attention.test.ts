@@ -301,3 +301,28 @@ describe('owner pace', () => {
     expect(a.next(TUNING.welcomeGatherMs + 100 + 60_000)?.kind).toBe('welcome');
   });
 });
+
+describe('话痨模式（没人的时候也接着说）', () => {
+  it('默认不给：没人在看就不开口', () => {
+    const a = new LiveAttention(0);
+    a.idleAfterMs = 10_000;
+    expect(a.next(60_000)).toBeNull();
+  });
+
+  it('打开后没人也接着说，而且 8 秒就开口（不管 idleAfterMs 设多大）', () => {
+    const a = new LiveAttention(0);
+    a.idleAfterMs = 45_000;
+    a.soloTalk = true;
+    expect(a.next(5_000)).toBeNull();
+    expect(a.next(10_000)?.kind).toBe('idle');
+  });
+
+  it('有人在看时还是按 idleAfterMs 来（话痨不把热闹房间逼成话痨）', () => {
+    const a = new LiveAttention(0);
+    a.idleAfterMs = 45_000;
+    a.soloTalk = true;
+    a.setOnline(5);
+    expect(a.next(10_000)).toBeNull();
+    expect(a.next(46_000)?.kind).toBe('idle');
+  });
+});

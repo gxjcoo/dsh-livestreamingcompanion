@@ -83,6 +83,8 @@ export interface ShowOptions {
   names: string[];
   /** 没话题时多久开始自己找话说（控制台设置，改了马上生效） */
   idleAfterMs?: () => number;
+  /** 话痨模式：没人在看也接着说（控制台设置，改了马上生效） */
+  soloTalk?: () => boolean;
   /** 主人定的节奏：欢迎、谢礼物、谢关注的间隔，一次回几位（控制台设置，改了马上生效） */
   pace?: () => OwnerPace;
   /** 告示板上写的（开场时告诉她，观众看得到什么） */
@@ -251,6 +253,7 @@ export class LiveShow {
   private freshAttention(): LiveAttention {
     const a = new LiveAttention(Date.now());
     if (this.options.idleAfterMs) a.idleAfterMs = this.options.idleAfterMs();
+    if (this.options.soloTalk) a.soloTalk = this.options.soloTalk();
     return a;
   }
 
@@ -580,6 +583,7 @@ export class LiveShow {
     // 控制台改的节奏马上生效：每一拍都按现在的设置来
     if (this.options.pace) this.attention.owner = this.options.pace();
     if (this.options.idleAfterMs) this.attention.idleAfterMs = this.options.idleAfterMs();
+    if (this.options.soloTalk) this.attention.soloTalk = this.options.soloTalk();
     this.attention.welcomeGapMs = gameOn ? GAME_WELCOME_GAP_MS : 0;
     this.attention.minChatPicks = gameOn ? GAME_CHAT_PICKS : 0;
     if (this.gameSession) void this.directGameLine(now);
@@ -641,6 +645,8 @@ export class LiveShow {
       today: topic.kind === 'opening' ? whenNow(d) : undefined,
       board: topic.kind === 'opening' ? this.options.board?.() : undefined,
       inGame: this.gameOn,
+      // 话痨模式下的冷场：让她多说几句、往下接，而不是一句就停
+      chatty: topic.kind === 'idle' && this.attention.soloTalk,
       gameNow: !this.gameSession ? undefined
         : this.resumingGame && !this.gameOn ? GAME_RESTARTING
         : this.gameOn ? this.gameNow || '刚开，还没有消息' : undefined,

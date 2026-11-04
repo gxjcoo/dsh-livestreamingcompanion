@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 插件的共享状态：宿主根插件（index.ts）和 agent 子插件（agent.ts）用同一份（同一个进程，同一个模块实例）。
  *
  *   - show：这一场直播的身体
@@ -59,6 +59,8 @@ export interface Settings {
   distillModel: string;
   /** 没话题多少秒后自己找话说 */
   idleAfterSec: number;
+  /** 话痨模式：直播间没人在看的时候也接着说（默认开：她平常话太少；嫌费钱在控制台关掉） */
+  talkWhenAlone: boolean;
   /** 她在玩游戏时，弹幕至少隔多少秒推给她一次（越大回得越少、玩得越多） */
   gameChatGapSec: number;
   /** 主人说是自己的直播间（记住常来的观众）；别的房间只旁观、不建档 */
@@ -200,6 +202,7 @@ function loadSettings(): Settings {
     stageToken: '',
     distillModel: 'deepseek-official/deepseek-flash',
     idleAfterSec: 45,
+    talkWhenAlone: true,
     gameChatGapSec: 15,
     ownRooms: [],
     ownDouyinRooms: [],
@@ -319,7 +322,7 @@ export const show = new LiveShow(
     persist: (snapshot) => saveLive(snapshot),
     onGame: (source) => placeGame(source),
   },
-  { dataDir, names: currentCharacter()?.names ?? [], idleAfterMs: () => settings.idleAfterSec * 1000, pace: () => ownerPace(settings.pace), board: () => settings.boardText, gameChatGapMs: () => (settings.gameChatGapSec ?? 15) * 1000 },
+  { dataDir, names: currentCharacter()?.names ?? [], idleAfterMs: () => settings.idleAfterSec * 1000, soloTalk: () => settings.talkWhenAlone, pace: () => ownerPace(settings.pace), board: () => settings.boardText, gameChatGapMs: () => (settings.gameChatGapSec ?? 15) * 1000 },
 );
 
 /**

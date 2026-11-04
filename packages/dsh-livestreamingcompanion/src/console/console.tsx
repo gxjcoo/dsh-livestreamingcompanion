@@ -105,7 +105,7 @@ interface HostState {
     douyinRoom?: number | null;
     douyinBrowser?: string;
     douyinAlsoListen?: boolean;
-    character: string; template: string; showTerminal?: boolean; voice: string; stagePort: number; idleAfterSec: number; gameChatGapSec?: number;
+    character: string; template: string; showTerminal?: boolean; voice: string; stagePort: number; idleAfterSec: number; gameChatGapSec?: number; talkWhenAlone?: boolean;
     distillModel: string; ownRooms: number[]; ownDouyinRooms?: number[]; broadcast: boolean; areaId: number | null; liveTitle: string;
     pushProtocol: 'srt' | 'rtmp'; streamKbps: number; manualPushAddr?: string; manualPushCode?: string; asrPython: string; asrModel: string;
     ttsBackend?: 'doubao' | 'gptsovits'; gptsovitsUrl?: string; gptsovitsRef?: string; gptsovitsPrompt?: string;
@@ -736,6 +736,17 @@ export function Console() {
                 <input defaultValue={settings?.idleAfterSec ?? 45} inputMode="numeric" title="找话说（秒）" onBlur={(e) => choose({ idleAfterSec: Number(e.target.value.replace(/\D/g, '')) || 45 })} />
                 <span className="dl-meta">秒：直播间没动静这么久，她自己找话说</span>
               </div>
+              <label className="dl-check">
+                <input
+                  type="checkbox"
+                  checked={!!settings?.talkWhenAlone}
+                  onChange={(e) => choose({ talkWhenAlone: e.target.checked })}
+                /> 没人的时候也接着说（话痨）
+              </label>
+              <p className="dl-hint">
+                勾上之后，直播间没人发弹幕、在线人数也少的时候她照样自己往下说，而且两次开口只隔 8 秒左右，听起来是连着在说。
+                不勾的话（默认）：没人看就不开口，省模型和配音的钱。
+              </p>
               <div className="dl-row">
                 <input defaultValue={settings?.gameChatGapSec ?? 15} inputMode="numeric" title="弹幕间隔（秒）" onBlur={(e) => choose({ gameChatGapSec: Number(e.target.value.replace(/\D/g, '')) || 15 })} />
                 <span className="dl-meta">秒：玩游戏时弹幕至少隔这么久推给她一次</span>

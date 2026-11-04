@@ -138,6 +138,10 @@ export class LiveAttention {
   private chatTimes: Array<{ at: number; uid: string }> = [];
   /** 没话题时多久开始自己找话说；可在直播中调整 */
   idleAfterMs = TUNING.idleAfterMs;
+  /** 话痨模式：直播间没人在看的时候也接着说，冷场间隔一口气压短（默认关：没人看就不烧 LLM 和配音） */
+  soloTalk = false;
+  /** 话痨模式下没人在看时，两次开口之间隔多久 */
+  soloIdleMs = 8_000;
 
   private lastSpeechEndAt: number;
   private speaking = false;
@@ -275,7 +279,12 @@ export class LiveAttention {
 
     if (!candidates.length) {
       const silentMs = now - this.lastSpeechEndAt;
-      if (!audience || this.speaking || silentMs < this.idleAfterMs) return null;
+      if (this.speaking) return null;
+      // 没人在看的时候平常不开口（省 LLM 和配音）；话痨模式照说，而且隔得短，听起来是连着在说
+      const solo = this.soloTalk && !audience;
+      if (!audience && !this.soloTalk) return null;
+      const wait = solo ? Math.min(this.idleAfterMs, this.soloIdleMs) : this.idleAfterMs;
+      if (silentMs < wait) return null;
       candidates.push({ priority: 1, build: () => ({ kind: 'idle', silentMs }) });
     }
 

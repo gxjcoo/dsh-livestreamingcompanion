@@ -362,7 +362,8 @@ export function apply(ctx: HostContext): void {
     }
     if (patch.showTerminal !== undefined) next.showTerminal = !!patch.showTerminal;
     if (patch.voice !== undefined) next.voice = String(patch.voice).trim();
-    if (patch.idleAfterSec !== undefined) next.idleAfterSec = Math.max(10, Math.min(600, Number(patch.idleAfterSec) || 45));
+    if (patch.idleAfterSec !== undefined) next.idleAfterSec = Math.max(3, Math.min(600, Number(patch.idleAfterSec) || 45));
+    if (patch.talkWhenAlone !== undefined) next.talkWhenAlone = !!patch.talkWhenAlone;
     if (patch.gameChatGapSec !== undefined) next.gameChatGapSec = Math.max(5, Math.min(120, Number(patch.gameChatGapSec) || 15));
     if (patch.pace !== undefined) next.pace = cleanPace({ ...settings.pace, ...patch.pace });
     if (patch.distillModel !== undefined) next.distillModel = String(patch.distillModel).trim() || settings.distillModel;
