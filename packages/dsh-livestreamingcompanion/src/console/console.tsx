@@ -113,6 +113,7 @@ interface HostState {
     pace?: { welcomeSec?: number | 'off'; thanksSec?: number; followSec?: number; chatPicks?: number };
   };
   stageUrl: string;
+  stageLanUrl?: string | null;
   characters: PackEntry[];
   templates: PackEntry[];
   asr: { available: boolean };
@@ -337,7 +338,7 @@ export function Console() {
   const [host, setHost] = useState<HostState | null>(null);
   const [busy, error, run] = useBusy();
   const [room, setRoom] = useState('');
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<'local' | 'lan' | null>(null);
   const [drawer, setDrawer] = useState(false);
   const [dock, setDock] = useState<'owner' | 'sim'>('owner');
   const previewRef = useRef<HTMLDivElement>(null);
@@ -395,10 +396,16 @@ export function Console() {
     if (!(status ?? host?.show)?.onAir) setDemo((n) => n + 1);
   });
 
-  const copyUrl = () => {
-    if (!host) return;
-    void navigator.clipboard.writeText(host.stageUrl).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); });
+  const copyStageUrl = (kind: 'local' | 'lan') => {
+    const url = kind === 'lan' ? host?.stageLanUrl : host?.stageUrl;
+    if (!url) return;
+    void navigator.clipboard.writeText(url).then(() => {
+      setCopied(kind);
+      setTimeout(() => setCopied((current) => current === kind ? null : current), 1500);
+    });
   };
+  const copyUrl = () => copyStageUrl('local');
+  const copyLanUrl = () => copyStageUrl('lan');
 
   const bc = liveBc ?? host?.broadcast ?? null;
   const conn = show?.live.state ?? 'idle';
@@ -483,9 +490,17 @@ export function Console() {
                 <div className="dl-obs">
                   <span className="dl-label">OBS 浏览器源</span>
                   <code onClick={copyUrl} title="点一下复制">{host?.stageUrl ?? ''}</code>
-                  <button className={copied ? 'dl-done' : ''} onClick={copyUrl}>{copied ? '已复制' : '复制'}</button>
+                  <button className={copied === 'local' ? 'dl-done' : ''} onClick={copyUrl}>{copied === 'local' ? '已复制' : '复制'}</button>
                   <span className="dl-meta">1920 × 1080</span>
                 </div>
+                {host?.stageLanUrl && (
+                  <div className="dl-obs">
+                    <span className="dl-label">手机 / 局域网</span>
+                    <code onClick={copyLanUrl} title="点一下复制；手机需与电脑连接同一网络">{host.stageLanUrl}</code>
+                    <button className={copied === 'lan' ? 'dl-done' : ''} onClick={copyLanUrl}>{copied === 'lan' ? '已复制' : '复制'}</button>
+                    <span className="dl-meta">同一 Wi-Fi</span>
+                  </div>
+                )}
               </div>
               <div className="dl-skins">
                 <span className="dl-label">主题</span>
@@ -679,15 +694,20 @@ export function Console() {
               {settings?.ttsBackend === 'doubao' ? (
                 <div className="dl-col">
                   <select value={settings?.voice ?? ''} onChange={(e) => choose({ voice: e.target.value })}>
-                    <option value="">默认：梦雅头（甜）</option>
+                    <option value="">默认：萌丫头（甜）</option>
+                    <option value="zh_female_wenjingmaomao_uranus_bigtts">文静毛毛（安静、呆萌）</option>
+                    <option value="zh_female_yingtaowanzi_uranus_bigtts">樱桃丸子（卡通、憨萌）</option>
+                    <option value="zh_female_xiaoxue_uranus_bigtts">儿童绘本（稚嫩童声）</option>
+                    <option value="zh_female_peiqi_uranus_bigtts">佩奇猪（卡通、搞怪）</option>
+                    <option value="ICL_uranus_zh_female_huopodiaoman_tob">活泼刁蛮（傲娇小公主）</option>
                     <option value="zh_female_zhixingnv_uranus_bigtts">知性女（稳）</option>
-                    <option value="zh_female_tianmeixiaoyuan_uranus_bigtts">甜美小圆（甜糯）</option>
+                    <option value="zh_female_tianmeixiaoyuan_uranus_bigtts">甜美小源（甜糯）</option>
                     <option value="zh_female_qingxinnvsheng_uranus_bigtts">清新女声（轻）</option>
                     <option value="zh_female_gaolengyujie_uranus_bigtts">高冷御姐（低）</option>
                     <option value="zh_female_wanwanxiaohe_uranus_bigtts">湾湾小何（软）</option>
                     <option value="zh_male_yuanboxiaoshu_uranus_bigtts">渊博小叔（男声）</option>
                   </select>
-                  <p className="dl-hint">换音色下一句就生效。这些是豆包 2.0 音色，我实测七个都能合成、都带逐字时间。</p>
+                  <p className="dl-hint">换音色下一句就生效。这些是豆包 2.0 音色，均已实际合成验证，带逐字时间。</p>
                 </div>
               ) : null}
               {settings?.ttsBackend === 'gptsovits' ? (
@@ -753,8 +773,18 @@ export function Console() {
               <label>OBS 舞台地址（来源 → 浏览器 → 粘贴，宽 1920 高 1080）</label>
               <div className="dl-row">
                 <input readOnly value={host?.stageUrl ?? ''} onFocus={(e) => e.currentTarget.select()} />
-                <button className={copied ? 'dl-done' : ''} onClick={copyUrl}>{copied ? '已复制' : '复制'}</button>
+                <button className={copied === 'local' ? 'dl-done' : ''} onClick={copyUrl}>{copied === 'local' ? '已复制' : '复制'}</button>
               </div>
+              {host?.stageLanUrl && (
+                <>
+                  <label>手机 / 局域网舞台地址</label>
+                  <div className="dl-row">
+                    <input readOnly value={host.stageLanUrl} onFocus={(e) => e.currentTarget.select()} />
+                    <button className={copied === 'lan' ? 'dl-done' : ''} onClick={copyLanUrl}>{copied === 'lan' ? '已复制' : '复制'}</button>
+                  </div>
+                  <p className="dl-hint">手机与电脑连接同一 Wi-Fi 后打开完整地址（包括 token）。仅在可信局域网使用，不要发到直播间或映射到公网；普通 HTTP 预览不支持手机摄像头采集。</p>
+                </>
+              )}
               <p className="dl-hint">想做自己的主题：把插件里 assets/templates/default 复制到 DSH 主目录的 dsh-livestream/templates/&lt;新名字&gt;/，改 template.json 的 id 和 name。</p>
               <label className="dl-check">
                 <input

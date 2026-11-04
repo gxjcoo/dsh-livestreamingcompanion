@@ -9,11 +9,13 @@
  *   GET  /video?id=…&token=…       正在放的视频（转发 B 站 CDN，带它要的 Referer，支持 Range）
  *   POST /media?id=…&state=…&token=…  视频开始放、放完、放不出来
  *
- * 所有请求都要带 token（OBS 里填的地址自带），只监听本机。
+ * 所有请求都要带 token（OBS 里填的地址自带）。监听本机和局域网网卡，供同一网络的手机预览；
+ * 不要把端口映射到公网，也不要把带 token 的完整地址发给观众。
  */
 
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { networkInterfaces } from 'node:os';
 import { basename, extname, join, normalize, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import type { StageEvent } from '../stage/protocol';
@@ -56,19 +58,42 @@ export interface StageServerOptions {
   log?(level: 'info' | 'warn', message: string): void;
 }
 
+const VIRTUAL_ADAPTER = /vethernet|virtual|vmware|virtualbox|docker|hyper-v|loopback|wsl/i;
+
+/** 给手机用的局域网地址：优先物理网卡的私网 IPv4，不拿回环或虚拟网卡凑数。 */
+export function lanIPv4(interfaces: ReturnType<typeof networkInterfaces> = networkInterfaces()): string | null {
+  const candidates = Object.entries(interfaces).flatMap(([name, list]) => (list ?? []).flatMap((item) => {
+    if (item.internal || item.family !== 'IPv4') return [];
+    const parts = item.address.split('.').map(Number);
+    const privateAddress = parts[0] === 10
+      || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
+      || (parts[0] === 192 && parts[1] === 168);
+    return privateAddress ? [{ address: item.address, virtual: VIRTUAL_ADAPTER.test(name) }] : [];
+  }));
+  return (candidates.find((item) => !item.virtual) ?? candidates[0])?.address ?? null;
+}
+
 export class StageServer {
   private server: Server | null = null;
+  private port: number;
 
   /** 舞台页代码的版本：lib/stage.js 的修改时间。插件更新、DSH 重启后变，开着的舞台页（OBS）看到就自己刷新 */
   private readonly build: string;
 
   constructor(private readonly options: StageServerOptions) {
+    this.port = options.port;
     const script = join(options.packageDir, 'lib', 'stage.js');
     this.build = existsSync(script) ? String(Math.round(statSync(script).mtimeMs)) : '';
   }
 
   get url(): string {
-    return `http://127.0.0.1:${this.options.port}/?token=${this.options.token}`;
+    return `http://127.0.0.1:${this.port}/?token=${this.options.token}`;
+  }
+
+  /** 同一 Wi-Fi / 局域网的手机打开这个地址；本机 OBS 仍用 url，避免受换网影响。 */
+  get lanUrl(): string | null {
+    const address = lanIPv4();
+    return address ? `http://${address}:${this.port}/?token=${this.options.token}` : null;
   }
 
   start(): Promise<void> {
@@ -82,8 +107,10 @@ export class StageServer {
       });
       server.requestTimeout = 0;
       server.once('error', reject);
-      server.listen(this.options.port, '127.0.0.1', () => {
+      server.listen(this.port, '0.0.0.0', () => {
         server.off('error', reject);
+        const address = server.address();
+        if (address && typeof address === 'object') this.port = address.port;
         // listen 之后原来的 reject 监听被摘掉了：不补一个持久的，运行期 socket 错误会变成未捕获异常
         server.on('error', (err: Error) => this.options.log?.('warn', `舞台服务器出错：${err.message}`));
         this.server = server;

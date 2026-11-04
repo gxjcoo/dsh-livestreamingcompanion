@@ -28,6 +28,9 @@ const WIDGETS: Partial<Record<WidgetType, React.ComponentType<{ options?: Record
   game: Game,
 };
 
+// 终端开关同时控制这些舞台辅助信息：状态条、左侧弹幕和终端；字幕、角色等不受影响。
+const TERMINAL_WIDGETS = new Set<WidgetType>(['terminal', 'status', 'chat']);
+
 function useViewport(): { width: number; height: number } {
   const [size, setSize] = useState({ width: innerWidth, height: innerHeight });
   useEffect(() => {
@@ -115,7 +118,7 @@ function App() {
       >
         {/* 背景和前景各几层空的 div：模板拿它们（和各自的 ::before / ::after）画光、气泡、云……，挂件在中间 */}
         <div className="ls-backdrop" style={hole}><i className="ls-layer ls-layer-1" /><i className="ls-layer ls-layer-2" /><i className="ls-layer ls-layer-3" /></div>
-        {slots.map((p) => <Placed key={p.key} p={p} hidden={p.type === 'terminal' && !terminalVisible} covered={!!speaking && sharesSubtitle(p)} full={p.x === 0 && p.y === 0 && p.w === cw && p.h === ch} />)}
+        {slots.map((p) => <Placed key={p.key} p={p} hidden={TERMINAL_WIDGETS.has(p.type) && !terminalVisible} covered={!!speaking && sharesSubtitle(p)} full={p.x === 0 && p.y === 0 && p.w === cw && p.h === ch} />)}
         <div className="ls-overlay" style={hole}><i className="ls-layer ls-layer-1" /><i className="ls-layer ls-layer-2" /></div>
         <Notice />
         <Vote />

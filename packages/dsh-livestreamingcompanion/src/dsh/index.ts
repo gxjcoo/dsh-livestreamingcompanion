@@ -54,6 +54,7 @@ function state() {
     secondary: show.secondary,
     settings: { ...settings, stageToken: undefined },
     stageUrl: server.url,
+    stageLanUrl: server.lanUrl,
     characters: packs.list('characters'),
     templates: packs.list('templates'),
     asr: { available: asr.available },
