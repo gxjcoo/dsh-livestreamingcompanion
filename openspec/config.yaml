@@ -1,0 +1,36 @@
+schema: spec-driven
+
+context: |
+  Language: Chinese (Simplified)
+  All artifacts must be written in Chinese (Simplified).
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+  本仓库只使用 OpenSpec 管理需求与变更，不使用 Superpowers 或其他并行流程。
+  实施型变更遵循 propose → apply → verify → archive；规划阶段不修改实现代码，验证通过后再归档。
+  每个里程碑使用独立 change，不把完整产品路线合并成一个庞大 change。
+  完整 M0～M7 产品路线见 openspec/ROADMAP.md；开始后续工作前先读取该文件、active change 和已归档主规格。
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always state what is out of scope
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
+operations:
+  archive:
+    guidance:
+      - 归档前确认已执行 verify 工作流；存在 CRITICAL 问题或未完成任务时，不归档，除非用户明确批准例外。
