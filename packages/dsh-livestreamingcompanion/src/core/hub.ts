@@ -164,11 +164,29 @@ export class LiveHub {
     let out: LiveEvent = event;
 
     if (event.kind === 'gift') {
+      // 连击 id 不能当帧 id：一段连击有很多帧，但同一帧重播不能再次累加。
+      if (event.messageId) {
+        if (this.seen.has(event.messageId)) return;
+        this.remember(event.messageId);
+      }
       const prev = this.gifts.get(event.id);
       if (prev && now - prev.ts <= GIFT_COMBO_MS) {
-        prev.count += event.count;
-        prev.valueYuan = Math.round((prev.valueYuan + event.valueYuan) * 1000) / 1000;
-        prev.ts = event.ts;
+        if (event.cumulative) {
+          // 抖音 repeatCount 是累计快照；迟到的旧快照直接忽略，重复快照也不延长静置计时。
+          if (event.count < prev.count) return;
+          const unchanged = event.count === prev.count && event.valueYuan === prev.valueYuan
+            && event.diamonds === prev.diamonds;
+          prev.count = event.count;
+          prev.valueYuan = event.valueYuan;
+          if (event.diamonds === undefined) delete prev.diamonds;
+          else prev.diamonds = event.diamonds;
+          if (!unchanged) prev.ts = event.ts;
+        } else {
+          prev.count += event.count;
+          prev.valueYuan = Math.round((prev.valueYuan + event.valueYuan) * 1000) / 1000;
+          if (event.diamonds !== undefined) prev.diamonds = (prev.diamonds ?? 0) + event.diamonds;
+          prev.ts = event.ts;
+        }
         out = prev;
         isUpdate = true;
       } else {

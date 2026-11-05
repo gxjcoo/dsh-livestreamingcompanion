@@ -159,4 +159,30 @@ describe('LiveHub', () => {
     expect(h.status(30).perMinute).toEqual({ chat: 2 });
     expect(h.status(70_000).perMinute).toEqual({});
   });
+
+  it('deduplicates a raw gift frame independently from its combo id', () => {
+    const h = hub();
+    const seen: number[] = [];
+    h.subscribe((event) => { if (event.kind === 'gift') seen.push(event.count); });
+    const frame: LiveGiftEvent = { ...gift('g1', 0), messageId: 'message-1' };
+    h.ingest(frame, 0);
+    h.ingest({ ...frame, ts: 1 }, 1);
+    expect(seen).toEqual([1]);
+    expect(h.recentEvents()[0]).toMatchObject({ count: 1, valueYuan: 0.1 });
+  });
+
+  it('replaces cumulative combo snapshots instead of adding them', () => {
+    const h = hub();
+    const snapshot = (count: number, ts: number, messageId: string): LiveGiftEvent => ({
+      ...gift('dy:gift:1:g', ts), platform: 'douyin', cumulative: true, messageId,
+      count, valueYuan: count / 10, diamonds: count,
+    });
+    h.ingest(snapshot(1, 0, 'm1'), 0);
+    h.ingest(snapshot(3, 1000, 'm2'), 1000);
+    h.ingest(snapshot(3, 1000, 'm2'), 1001); // 同一帧重播
+    h.ingest(snapshot(3, 2000, 'm3'), 2000); // 不同帧的相同累计快照
+    h.ingest(snapshot(2, 2500, 'm4'), 2500); // 迟到的旧快照
+    expect(h.recentEvents()).toHaveLength(1);
+    expect(h.recentEvents()[0]).toMatchObject({ count: 3, valueYuan: 0.3, diamonds: 3, ts: 1000 });
+  });
 });

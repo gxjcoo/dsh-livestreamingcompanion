@@ -158,9 +158,11 @@ function giftV2(msg: Json, ctx: BiliRoomContext, now: number): LiveEvent | null 
   if (!pb || !gift) return null;
   const count = pbNumber(gift, 3) || 1;
   const total = pbNumber(gift, 6) || pbNumber(gift, 5) * count;
-  const combo = pbString(gift, 12) || pbId(gift, 9);
+  const tid = pbId(gift, 9);
+  const combo = pbString(gift, 12) || tid;
   return {
     id: combo ? `bili:gift:${combo}` : nextId('gift'),
+    ...(tid ? { messageId: `bili:gift-frame:${tid}` } : {}),
     platform: 'bilibili',
     kind: 'gift',
     ts: now,
@@ -175,9 +177,11 @@ function giftV1(msg: Json, ctx: BiliRoomContext, now: number): LiveEvent | null 
   const d = msg.data;
   if (!d) return null;
   const count = Number(d.num ?? 1);
-  const combo = d.batch_combo_id || d.tid;
+  const tid = d.tid === undefined || d.tid === null ? '' : String(d.tid);
+  const combo = d.batch_combo_id || tid;
   return {
     id: combo ? `bili:gift:${combo}` : nextId('gift'),
+    ...(tid ? { messageId: `bili:gift-frame:${tid}` } : {}),
     platform: 'bilibili',
     kind: 'gift',
     ts: now,

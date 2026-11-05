@@ -16,6 +16,7 @@
 
 import { isHighFanLevel } from '../live';
 import type {
+  LiveActionEvent,
   LiveChatEvent,
   LiveEvent,
   LiveGiftEvent,
@@ -25,7 +26,7 @@ import type {
 } from '../live';
 import { sanitizeChat } from '../safety';
 import { chatFeatures, type ChatFeatures } from './features';
-import type { ChatPick, RoomHeat, Topic, TopicBody } from './topics';
+import type { ChatPick, RoomHeat, SupportEntry, Topic, TopicBody } from './topics';
 
 /** 可调参数集中在这里 */
 /** 主人定的节奏（控制台「节奏」里填的；没填的项不出现，按热度自动） */
@@ -65,6 +66,13 @@ export const TUNING = {
   bigGiftYuan: 5,
   /** 礼物连击停下这么久才算送完，免得谢的时候数量还在涨 */
   comboSettleMs: 3_000,
+  /** 点赞/分享最多攒这么久就先谢一批；持续刷屏也不能一直等“安静下来” */
+  supportGatherMs: 3_000,
+  /** 每类普通支持最多保留多少人的名字；更多观众由集体感谢覆盖 */
+  maxSupportUsers: 32,
+  /** 已交付的连击只在这段时间内抑制迟到/重复更新；新连击超时后本就会换逻辑 id */
+  thankedGiftTtlMs: 30 * 60_000,
+  maxThankedGifts: 4000,
   /** 两次感谢小礼物之间至少间隔 */
   giftsIntervalMs: { quiet: 0, normal: 20_000, busy: 45_000 } as Record<RoomHeat, number>,
   welcomeIntervalMs: { quiet: 0, normal: 60_000, busy: 90_000 } as Record<RoomHeat, number>,
@@ -101,6 +109,21 @@ interface UserMemory {
   answeredAt?: number;
 }
 
+interface SupportGroup {
+  users: Map<string, SupportEntry>;
+  firstAt: number;
+  overflow: boolean;
+}
+
+interface ThankedGift {
+  at: number;
+  count: number;
+  valueYuan: number;
+  diamonds: number;
+}
+
+const emptySupport = (): SupportGroup => ({ users: new Map(), firstAt: Infinity, overflow: false });
+
 const GUARD_TAG: Record<number, string> = { 1: '总督', 2: '提督', 3: '舰长' };
 
 export interface AttentionSnapshot {
@@ -113,6 +136,7 @@ export interface AttentionSnapshot {
     superchats: number;
     thanks: number;
     gifts: number;
+    support: number;
     welcome: number;
     follow: number;
     trends: number;
@@ -124,6 +148,9 @@ export class LiveAttention {
   private superchats: LiveSuperChatEvent[] = [];
   private bigThanks = new Map<string, LiveGiftEvent | LiveMembershipEvent>();
   private smallGifts = new Map<string, LiveGiftEvent>();
+  /** 已交给麦克风的连击总量：重复帧不谢，继续增长时只谢新增部分 */
+  private thankedGifts = new Map<string, ThankedGift>();
+  private support: Record<'like' | 'share', SupportGroup> = { like: emptySupport(), share: emptySupport() };
   private enters: Array<{ user: LiveUser; at: number }> = [];
   private follows: Array<{ user: LiveUser; at: number }> = [];
   /** 主人用主播号发的弹幕（搭档说话，走 owner 话题） */
@@ -176,16 +203,29 @@ export class LiveAttention {
       case 'chat': if (!isUpdate) this.observeChat(event, now); break;
       case 'superchat': if (!isUpdate) this.superchats.push(event); break;
       case 'membership': this.bigThanks.set(event.id, event); break;
-      case 'gift':
-        if (event.valueYuan >= TUNING.bigGiftYuan) {
-          this.smallGifts.delete(event.id); // 连击累计到了大额
-          this.bigThanks.set(event.id, event);
+      case 'gift': {
+        const thanked = this.thankedGifts.get(event.id);
+        let gift = event;
+        if (thanked) {
+          const count = Math.max(0, event.count - thanked.count);
+          const valueYuan = Math.max(0, Math.round((event.valueYuan - thanked.valueYuan) * 1000) / 1000);
+          const diamonds = Math.max(0, (event.diamonds ?? 0) - thanked.diamonds);
+          if (!count && !valueYuan && !diamonds) break;
+          gift = { ...event, count, valueYuan, ...(event.diamonds === undefined ? {} : { diamonds }) };
+        }
+        if (gift.valueYuan >= TUNING.bigGiftYuan) {
+          this.smallGifts.delete(gift.id); // 连击累计到了大额
+          this.bigThanks.set(gift.id, gift);
         } else {
-          this.smallGifts.set(event.id, event);
+          this.smallGifts.set(gift.id, gift);
         }
         break;
+      }
       case 'enter': this.observeEnter(event.user, now); break;
       case 'follow': if (!isUpdate && !this.isOwner(event.user)) this.follows.push({ user: event.user, at: now }); break;
+      case 'like': case 'share':
+        if (!isUpdate && !this.isOwner(event.user)) this.observeSupport(event, now);
+        break;
       default: break;
     }
   }
@@ -271,6 +311,9 @@ export class LiveAttention {
     const gifts = this.giftsCandidate(heat, now);
     if (gifts) candidates.push(gifts);
 
+    const support = this.supportCandidate(heat, now);
+    if (support) candidates.push(support);
+
     const follow = this.followCandidate(heat, now);
     if (follow) candidates.push(follow);
 
@@ -295,6 +338,71 @@ export class LiveAttention {
     return { ...body, id: `topic-${++this.seq}`, priority: best.priority, heat, createdAt: now };
   }
 
+  /** 纯感谢成功交给麦克风后登记连击；在交付前调用会误吞迟到事件，因此由身体在入队时确认。 */
+  acknowledge(topic: Topic, now: number): void {
+    if (topic.kind !== 'thanks' && topic.kind !== 'gifts') return;
+    for (const event of topic.events) {
+      if (event.kind !== 'gift') continue;
+      const previous = this.thankedGifts.get(event.id);
+      this.thankedGifts.delete(event.id);
+      this.thankedGifts.set(event.id, {
+        at: now,
+        count: (previous?.count ?? 0) + event.count,
+        valueYuan: Math.round(((previous?.valueYuan ?? 0) + event.valueYuan) * 1000) / 1000,
+        diamonds: (previous?.diamonds ?? 0) + (event.diamonds ?? 0),
+      });
+    }
+    while (this.thankedGifts.size > TUNING.maxThankedGifts) {
+      const oldest = this.thankedGifts.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.thankedGifts.delete(oldest);
+    }
+  }
+
+  /** 明确在交给麦克风之前失败时恢复；交付后的异常不重放，避免同一句谢两遍。 */
+  restore(topic: Topic, acknowledged = false): void {
+    const restoreGift = (event: LiveGiftEvent): void => {
+      if (!acknowledged) return;
+      const thanked = this.thankedGifts.get(event.id);
+      if (!thanked) return;
+      const previous = {
+        at: thanked.at,
+        count: Math.max(0, thanked.count - event.count),
+        valueYuan: Math.max(0, Math.round((thanked.valueYuan - event.valueYuan) * 1000) / 1000),
+        diamonds: Math.max(0, thanked.diamonds - (event.diamonds ?? 0)),
+      };
+      if (!previous.count && !previous.valueYuan && !previous.diamonds) this.thankedGifts.delete(event.id);
+      else this.thankedGifts.set(event.id, previous);
+    };
+    switch (topic.kind) {
+      case 'thanks':
+        for (const event of topic.events) {
+          this.bigThanks.set(event.id, event);
+          if (event.kind === 'gift') restoreGift(event);
+        }
+        break;
+      case 'gifts':
+        for (const event of topic.events) {
+          this.smallGifts.set(event.id, event);
+          restoreGift(event);
+        }
+        break;
+      case 'support':
+        this.restoreSupportEntries('like', topic.likes, topic.createdAt);
+        this.restoreSupportEntries('share', topic.shares, topic.createdAt);
+        if (topic.overflow) {
+          if (topic.likes.length) this.support.like.overflow = true;
+          if (topic.shares.length) this.support.share.overflow = true;
+        }
+        break;
+      case 'follow':
+        this.follows.unshift(...topic.users.map((user) => ({ user, at: topic.createdAt })));
+        break;
+      default:
+        break;
+    }
+  }
+
   snapshot(now: number): AttentionSnapshot {
     this.prune(now);
     return {
@@ -306,6 +414,8 @@ export class LiveAttention {
         superchats: this.superchats.length,
         thanks: this.bigThanks.size,
         gifts: this.smallGifts.size,
+        support: this.support.like.users.size + this.support.share.users.size
+          + Number(this.support.like.overflow || this.support.share.overflow),
         welcome: this.enters.length,
         follow: this.follows.length,
         trends: [...this.trendHits.values()].filter((hits) => hits.length > 1).length,
@@ -433,6 +543,64 @@ export class LiveAttention {
     };
   }
 
+  // ── 点赞与分享 ───────────────────────────────────────
+
+  private observeSupport(event: LiveActionEvent, now: number): void {
+    if (event.kind !== 'like' && event.kind !== 'share') return;
+    const raw = event.count ?? 1;
+    const count = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1;
+    this.addSupport(event.kind, event.user, count, now);
+  }
+
+  private addSupport(kind: 'like' | 'share', user: LiveUser, count: number, at: number): void {
+    const group = this.support[kind];
+    group.firstAt = Math.min(group.firstAt, at);
+    const key = user.id || user.name;
+    const existing = group.users.get(key);
+    if (existing) {
+      existing.count += count;
+      existing.user = user;
+    } else if (group.users.size >= TUNING.maxSupportUsers) {
+      // 不为每位新观众无限保留状态；这批仍会集体谢到他们。
+      group.overflow = true;
+    } else {
+      group.users.set(key, { user, count });
+    }
+  }
+
+  private restoreSupportEntries(kind: 'like' | 'share', entries: SupportEntry[], at: number): void {
+    for (const entry of entries) this.addSupport(kind, entry.user, entry.count, at);
+  }
+
+  private supportCandidate(heat: RoomHeat, now: number): { priority: number; build: () => TopicBody } | null {
+    const active = (['like', 'share'] as const).filter((kind) => this.support[kind].users.size > 0);
+    if (!active.length) return null;
+    const oldest = Math.min(...active.map((kind) => this.support[kind].firstAt));
+    if (now - oldest < TUNING.supportGatherMs) return null;
+    if (now - (this.lastSaid.support ?? -Infinity) < (this.owner.thanksGapMs ?? TUNING.giftsIntervalMs[heat])) return null;
+    return {
+      priority: Math.min(80, 40 + (now - oldest) / 2000),
+      build: () => {
+        const likes = this.takeSupport('like');
+        const shares = this.takeSupport('share');
+        return {
+          kind: 'support',
+          likes: likes.entries,
+          shares: shares.entries,
+          overflow: likes.overflow || shares.overflow,
+        };
+      },
+    };
+  }
+
+  private takeSupport(kind: 'like' | 'share'): { entries: SupportEntry[]; overflow: boolean } {
+    const group = this.support[kind];
+    const entries = [...group.users.values()].slice(0, 3);
+    const overflow = group.overflow || group.users.size > entries.length;
+    this.support[kind] = emptySupport();
+    return { entries, overflow };
+  }
+
   // ── 礼物 ─────────────────────────────────────────────
 
   private settled(e: LiveGiftEvent | LiveMembershipEvent, now: number): boolean {
@@ -440,23 +608,24 @@ export class LiveAttention {
   }
 
   private giftsCandidate(heat: RoomHeat, now: number): { priority: number; build: () => TopicBody } | null {
-    // 免费礼物只在冷清的时候谢
-    const ready = [...this.smallGifts.values()].filter((g) => this.settled(g, now) && (g.valueYuan > 0 || heat === 'quiet'));
+    // 免费礼物也值得感谢；间隔只用于攒批，不再按房间热度或等待时长丢弃。
+    const ready = [...this.smallGifts.values()].filter((g) => this.settled(g, now));
     if (!ready.length) return null;
     if (now - (this.lastSaid.gifts ?? -Infinity) < (this.owner.thanksGapMs ?? TUNING.giftsIntervalMs[heat])) return null;
     const oldest = Math.min(...ready.map((g) => g.ts));
     return {
-      priority: Math.min(75, 35 + (now - oldest) / 2000),
+      priority: Math.min(85, 35 + (now - oldest) / 2000),
       build: () => {
-        // 同一个人的礼物合在一起，按金额排
+        // 同一个人的礼物合在一起，按金额排；没进这批的人继续等下一批，不静默丢弃。
         const byUser = new Map<string, LiveGiftEvent[]>();
         for (const g of ready) {
-          this.smallGifts.delete(g.id);
           const key = g.user.id || g.user.name;
           byUser.set(key, [...(byUser.get(key) ?? []), g]);
         }
         const ranked = [...byUser.values()].sort((a, b) => sum(b) - sum(a));
-        return { kind: 'gifts', events: ranked.slice(0, 3).flat(), more: Math.max(0, ranked.length - 3) };
+        const picked = ranked.slice(0, 3);
+        for (const gifts of picked) for (const gift of gifts) this.smallGifts.delete(gift.id);
+        return { kind: 'gifts', events: picked.flat(), more: Math.max(0, ranked.length - picked.length) };
       },
     };
   }
@@ -503,8 +672,10 @@ export class LiveAttention {
       priority: Math.min(60, 30 + (now - oldest) / 2000),
       build: () => {
         const users = uniqueUsers(this.follows.map((f) => f.user));
-        this.follows = [];
-        return { kind: 'follow', users: users.slice(0, 3), more: Math.max(0, users.length - 3) };
+        const picked = users.slice(0, 3);
+        const keys = new Set(picked.map((user) => user.id || user.name));
+        this.follows = this.follows.filter((entry) => !keys.has(entry.user.id || entry.user.name));
+        return { kind: 'follow', users: picked, more: Math.max(0, users.length - picked.length) };
       },
     };
   }
@@ -536,15 +707,13 @@ export class LiveAttention {
     const maxAge = TUNING.chatTauSec[heat] * 3000;
     this.chats = this.chats.filter((c) => now - c.at <= maxAge);
     this.enters = this.enters.filter((e) => now - e.at <= TUNING.welcomeTtlMs);
-    this.follows = this.follows.filter((f) => now - f.at <= 5 * 60_000);
     for (const [key, hits] of this.trendHits) {
       const fresh = hits.filter((h) => now - h.at <= TUNING.trend.windowMs);
       if (fresh.length) this.trendHits.set(key, fresh);
       else this.trendHits.delete(key);
     }
     for (const [key, until] of this.trendCooldown) if (until <= now) this.trendCooldown.delete(key);
-    // 小礼物等太久就不谢了（热闹时会被更要紧的事挤掉）
-    for (const [id, g] of this.smallGifts) if (now - g.ts > 3 * 60_000) this.smallGifts.delete(id);
+    for (const [id, thanked] of this.thankedGifts) if (now - thanked.at > TUNING.thankedGiftTtlMs) this.thankedGifts.delete(id);
   }
 }
 

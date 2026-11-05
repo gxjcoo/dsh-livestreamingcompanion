@@ -54,6 +54,10 @@ export interface LiveChatEvent extends LiveEventBase {
 
 export interface LiveGiftEvent extends LiveEventBase {
   kind: 'gift';
+  /** 平台这一帧的原始消息 id：用于重播去重；id 则用于整段连击聚合 */
+  messageId?: string;
+  /** true：count/valueYuan/diamonds 是截至这一帧的累计快照，不能再与上一帧相加（抖音） */
+  cumulative?: boolean;
   giftName: string;
   count: number;
   /** 折合人民币（元）；免费礼物为 0 */
@@ -80,6 +84,8 @@ export interface LiveMembershipEvent extends LiveEventBase {
 /** 进场、关注、分享、点赞：量大、单条价值低，弹幕姬里按计数展示 */
 export interface LiveActionEvent extends LiveEventBase {
   kind: 'enter' | 'follow' | 'share' | 'like';
+  /** 这一条平台消息代表的次数；缺省就是 1，不能用房间累计总数代替 */
+  count?: number;
 }
 
 export type LiveEvent =

@@ -109,6 +109,9 @@ function body(topic: Topic, ctx: TopicContext): Body {
       if (topic.more) lines.push(`- 还有另外 ${topic.more} 位也送了小礼物`);
       return { what: ['这段时间收到的小礼物：', ...lines], how: '用一句轻快的话一起谢谢大家，点名不超过三位。', maxChars: 50 };
     }
+    case 'support':
+      // LiveShow 会用 thanksText 直接播报；保留这个分支只为完整的 Topic 渲染契约。
+      return { what: ['观众刚刚点赞或分享了直播。'], how: '简短感谢大家的点赞和分享。', maxChars: 45 };
     case 'trend':
       return {
         what: [`有 ${topic.users} 位观众在刷同样的弹幕：${topic.samples.map((s) => `「${cleanText(s)}」`).join(' ')}`],

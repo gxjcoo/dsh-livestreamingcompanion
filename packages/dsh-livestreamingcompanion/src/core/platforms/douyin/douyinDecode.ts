@@ -76,6 +76,14 @@ function chatId(common: PbMessage | undefined, user: LiveUser, text: string): st
   return `dy:dm:${msgId || 'x'}:${digest}`;
 }
 
+/** 有点平台消息 id 时，动作重放仍得到同一个 id；批次内重复 msgId 再由用户和动作内容区分。 */
+function actionId(common: PbMessage | undefined, kind: string, user: LiveUser, detail = ''): string {
+  const msgId = pbId(common, 2);
+  if (!msgId) return nextId(kind);
+  const digest = createHash('md5').update(`${user.id}|${user.name}|${detail}`).digest('hex').slice(0, 10);
+  return `dy:${kind}:${msgId}:${digest}`;
+}
+
 /** User { 1 id, 3 nickname, 6 honorLevel, 9 avatarThumb{1 url_list}, 24 fansClub, 38 displayId, 46 secUid } */
 function userOf(msg: PbMessage | undefined, ctx: DouyinContext): LiveUser {
   const id = pbId(msg, 1);
@@ -111,8 +119,9 @@ function member(body: PbMessage, ctx: DouyinContext, now: number): DouyinOutput[
   const count = pbNumber(body, 3);
   const out: DouyinOutput[] = [];
   // 1 进房；2/3/4/5 关注、分享这类（有的版本用 SocialMessage 报）
-  if (action === 1) out.push({ type: 'event', event: { id: nextId('enter'), platform: 'douyin', kind: 'enter', ts: now, user } });
-  else if (action === 2) out.push({ type: 'event', event: { id: nextId('follow'), platform: 'douyin', kind: 'follow', ts: now, user } });
+  const common = pbChild(body, 1);
+  if (action === 1) out.push({ type: 'event', event: { id: actionId(common, 'enter', user), platform: 'douyin', kind: 'enter', ts: now, user } });
+  else if (action === 2) out.push({ type: 'event', event: { id: actionId(common, 'follow', user), platform: 'douyin', kind: 'follow', ts: now, user } });
   if (count > 0) out.push({ type: 'stats', stats: { online: count } });
   return out;
 }
@@ -128,9 +137,13 @@ function gift(body: PbMessage, ctx: DouyinContext, now: number): LiveEvent | nul
   const group = pbId(body, 11) || pbString(body, 11) || pbId(body, 16);
   const user = userOf(pbChild(body, 7), ctx);
   const combo = group ? `${user.id}:${giftId}:${group}` : '';
+  const common = pbChild(body, 1);
+  const messageId = pbId(common, 2) ? actionId(common, 'gift-frame', user, `${combo}|${count}`) : undefined;
   const diamonds = unit * count;
   return {
     id: combo ? `dy:gift:${combo}` : nextId('gift'),
+    ...(messageId ? { messageId } : {}),
+    cumulative: true,
     platform: 'douyin',
     kind: 'gift',
     ts: now,
@@ -145,18 +158,22 @@ function gift(body: PbMessage, ctx: DouyinContext, now: number): LiveEvent | nul
 
 function like(body: PbMessage, ctx: DouyinContext, now: number): DouyinOutput[] {
   const total = pbNumber(body, 3);
+  const count = Math.max(1, Math.floor(pbNumber(body, 2) || 1));
+  const user = userOf(pbChild(body, 5), ctx);
+  const common = pbChild(body, 1);
   const out: DouyinOutput[] = [];
   if (total > 0) out.push({ type: 'stats', stats: { likes: total } });
-  out.push({ type: 'event', event: { id: nextId('like'), platform: 'douyin', kind: 'like', ts: now, user: userOf(pbChild(body, 5), ctx) } });
+  out.push({ type: 'event', event: { id: actionId(common, 'like', user, String(count)), platform: 'douyin', kind: 'like', ts: now, user, count } });
   return out;
 }
 
 function social(body: PbMessage, ctx: DouyinContext, now: number): LiveEvent | null {
   const user = userOf(pbChild(body, 2), ctx);
   const share = pbNumber(body, 3);
+  const common = pbChild(body, 1);
   // 3 是分享；关注由 MemberMessage(action=2) 报
-  if (share > 0) return { id: nextId('share'), platform: 'douyin', kind: 'share', ts: now, user };
-  return { id: nextId('follow'), platform: 'douyin', kind: 'follow', ts: now, user };
+  if (share > 0) return { id: actionId(common, 'share', user, String(share)), platform: 'douyin', kind: 'share', ts: now, user };
+  return { id: actionId(common, 'follow', user), platform: 'douyin', kind: 'follow', ts: now, user };
 }
 
 function roomUserSeq(body: PbMessage): DouyinOutput[] {

@@ -21,6 +21,7 @@ import { LiveMemory } from '../core/memory/memory';
 import { LiveMemoryStore } from '../core/memory/store';
 import { cleanName, cleanText } from '../core/safety';
 import { speakable } from '../core/speakable';
+import { thanksText } from '../core/thanks';
 import { topicText } from '../core/topicText';
 import { lookupViewer, type ViewerLookup } from '../core/viewerLookup';
 import type { BrainState, GameSource, GameStatus, StageLiveEvent, StageUser } from '../stage/protocol';
@@ -223,6 +224,8 @@ export class LiveShow {
   /** 排在弹幕前面的事：主人的话、开场、谢幕 */
   private priority: TopicBody[] = [];
   private speaking = 0;
+  /** 本地确定性感谢的取消器：只取消本场尚未交付/正在交付的感谢，不碰游戏语音 */
+  private localThanks = new Set<AbortController>();
   /** 她写好、还没念完的话（包括排着队等嘴的）：导演看这个决定要不要推下一件 */
   private queued = 0;
   private lines: SpokenLine[] = [];
@@ -255,6 +258,11 @@ export class LiveShow {
     if (this.options.idleAfterMs) a.idleAfterMs = this.options.idleAfterMs();
     if (this.options.soloTalk) a.soloTalk = this.options.soloTalk();
     return a;
+  }
+
+  private cancelLocalThanks(): void {
+    for (const controller of this.localThanks) controller.abort();
+    this.localThanks.clear();
   }
 
   setNames(names: string[]): void {
@@ -360,6 +368,7 @@ export class LiveShow {
     this.gameSession = gameSessionId ?? null;
     if (this.onAir) return;
     this.resetGameLine();
+    this.cancelLocalThanks();
     this.onAir = true;
     this.ending = false;
     this.endingPushed = false;
@@ -397,6 +406,7 @@ export class LiveShow {
     this.ending = false;
     this.endingPushed = false;
     this.turnRunning = false;
+    this.cancelLocalThanks();
     this.attention = this.freshAttention();
     this.memoryStream = snapshot.streamId !== null;
     if (snapshot.streamId !== null) this.memory.resume(snapshot.streamId);
@@ -451,6 +461,7 @@ export class LiveShow {
     if (this.endingTimer) clearTimeout(this.endingTimer);
     this.endingTimer = null;
     if (!this.onAir) return;
+    this.cancelLocalThanks();
     this.stopVideo('off');
     this.onAir = false;
     this.ending = false;
@@ -611,7 +622,9 @@ export class LiveShow {
     if (this.queued >= GAME_MOUTH_BACKLOG) return;
     const topic = this.takeLive(now);
     if (!topic) return;
-    if (!(await this.deliver(topic, now, true))) return;
+    const delivered = await this.deliver(topic, now, true);
+    // 本地感谢只上直播麦克风：不是给同会话游戏线的新消息，不能叫醒 game_continue。
+    if (delivered !== 'model') return;
     this.gamePushedAt = Date.now();
     for (const wake of [...this.attentionWaiters]) wake();
   }
@@ -632,12 +645,42 @@ export class LiveShow {
     return { kind: 'game', id: `g-${now}`, priority: 1, heat: this.attention.heat(now), createdAt: now };
   }
 
-  /** 把一件事推进她的会话；推成了返回 true */
-  private async deliver(topic: Topic, now: number, midTurn = false): Promise<boolean> {
+  /** model：推进了直播会话；local：只交给直播麦克风；false：本场不再交付 */
+  private async deliver(topic: Topic, now: number, midTurn = false): Promise<'model' | 'local' | false> {
     this.seq += 1;
     const focus = focusOf(topic);
     if (focus.length) this.stage.broadcast({ type: 'focus', userIds: focus });
     this.record({ type: 'topic', seq: this.seq, kind: topic.kind });
+
+    const gratitude = thanksText(topic);
+    if (gratitude !== null) {
+      if (!this.onAir || this.ending || !gratitude) {
+        this.attention.restore(topic);
+        return false;
+      }
+      const controller = new AbortController();
+      this.localThanks.add(controller);
+      this.pushing = true;
+      try {
+        // say 在返回 Promise 前已经放进 withMic：从这里起就是已交付，后面的合成/播放失败不能盲目重放。
+        const pending = this.say(gratitude, 'happy', controller.signal, 'live');
+        this.attention.acknowledge(topic, Date.now());
+        const spoken = await pending;
+        if (!spoken) {
+          // 明确没进麦克风（例如取消或空台词）才恢复；新开播会用 freshAttention 清掉旧场次。
+          this.attention.restore(topic, true);
+          return false;
+        }
+        return 'local';
+      } catch (error) {
+        this.hooks.log?.('warn', `感谢播报中断：${(error as Error).message}`);
+        return false;
+      } finally {
+        this.localThanks.delete(controller);
+        this.pushing = false;
+      }
+    }
+
     const d = new Date(now);
     const text = topicText(topic, {
       viewerCard: (u: LiveUser) => this.memory.viewerCard(u, now),
@@ -665,7 +708,7 @@ export class LiveShow {
       this.turnRunning = true;
       this.turnSince = Date.now();
       if (topic.kind === 'ending') this.endingPushed = true;
-      return true;
+      return 'model';
     } finally {
       this.pushing = false;
     }
@@ -750,16 +793,22 @@ export class LiveShow {
   /** 念她写的话：合成语音、交给舞台、等念完 */
   async say(raw: string, mood: string, signal: AbortSignal, line: 'live' | 'game' = 'live'): Promise<string> {
     const text = speakable(raw);
-    if (!text) return '';
+    if (!text || signal.aborted) return '';
     // 嘴两条线共用、按先后念：游戏线的话一句不丢（死了、危险、拿到装备都在这里说）；直播线推下一件事时不等游戏线的话
     const game = line === 'game';
     this.queued += 1;
     if (game) this.queuedGame += 1;
     return this.stage.withMic(async () => {
+      if (signal.aborted) {
+        this.queued -= 1;
+        if (game) this.queuedGame -= 1;
+        return '';
+      }
       this.speaking += 1;
       this.attention.speechStarted();
       this.setBrain('speaking');
       const start = Date.now();
+      let announced = false;
       try {
         let speech: { audio: Uint8Array; timeline: Array<{ chars: number; atMs: number }> } | null = null;
         // 合成一段平时不到 2 秒：一次最多等 SYNTH_TIMEOUT_MS，卡住了马上再试一次（实测豆包偶尔一个请求一直不回，等满两分钟直播就冷场了）
@@ -770,9 +819,11 @@ export class LiveShow {
             this.hooks.log?.('warn', `语音合成失败（第 ${attempt} 次）：${(err as Error).message}`);
           }
         }
+        if (signal.aborted) return '';
         const id = randomUUID();
         const estimateMs = estimateSpeechMs(text);
         const done = this.stage.waitSaid(id, estimateMs, signal);
+        announced = true;
         this.stage.broadcast({
           type: 'say', id, text, mood, estimateMs,
           audio: speech ? Buffer.from(speech.audio).toString('base64') : null,
@@ -784,10 +835,12 @@ export class LiveShow {
         this.queued -= 1;
         if (game) this.queuedGame -= 1;
         this.attention.speechEnded(Date.now());
-        this.lines = [...this.lines, { text, mood, at: start }].slice(-RECENT_LINES);
-        this.herLines.push(text);
-        this.spoken += [...text].length;
-        this.record({ type: 'say', text, mood, start, end: Date.now() });
+        if (announced) {
+          this.lines = [...this.lines, { text, mood, at: start }].slice(-RECENT_LINES);
+          this.herLines.push(text);
+          this.spoken += [...text].length;
+          this.record({ type: 'say', text, mood, start, end: Date.now() });
+        }
         this.setBrain(!this.onAir ? 'off' : this.turnRunning ? 'thinking' : 'listening');
       }
       return text;
@@ -1024,6 +1077,7 @@ export class LiveShow {
 
   /** 插件停了（多半是 DSH 重启、更新）：在播的这一场不收尾，存好，起来以后接着播 */
   dispose(): void {
+    this.cancelLocalThanks();
     this.votes.cancel();
     if (this.onAir && !this.ending) {
       this.persistLive();
@@ -1045,7 +1099,7 @@ export function estimateSpeechMs(text: string): number {
 
 
 const KIND_LABEL: Record<Topic['kind'], string> = {
-  chat: '在看弹幕', superchat: '在看醒目留言', thanks: '在谢礼物', gifts: '在谢礼物', trend: '在看大家刷屏',
+  chat: '在看弹幕', superchat: '在看醒目留言', thanks: '在谢礼物', gifts: '在谢礼物', support: '在谢点赞和分享', trend: '在看大家刷屏',
   welcome: '在欢迎新观众', follow: '在谢关注', idle: '在找话说', opening: '在准备开场', ending: '在准备道别', owner: '在听主人说话',
   video: '视频放完了', watching: '在看视频', inbox: '在看私信和评论', resumed: '在接着播', game: '在玩游戏',
 };
@@ -1061,6 +1115,7 @@ function focusOf(topic: Topic): string[] {
     case 'chat': return ids(topic.picks.map((p) => p.event.user));
     case 'superchat': return ids([topic.event.user]);
     case 'thanks': case 'gifts': return ids(topic.events.map((e) => e.user));
+    case 'support': return ids([...topic.likes, ...topic.shares].map((entry) => entry.user));
     case 'welcome': case 'follow': return ids(topic.users);
     default: return [];
   }

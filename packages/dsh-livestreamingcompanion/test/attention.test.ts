@@ -72,6 +72,7 @@ function describeTopic(t: Topic): string {
     case 'superchat': return `SC ¥${t.event.valueYuan} ${who(t.event.user)}「${t.event.text}」`;
     case 'thanks': return `thanks ${t.events.map((e) => `${who(e.user)} ${e.kind === 'gift' ? `${e.giftName}×${e.count}` : e.levelName} ¥${e.valueYuan}`).join(', ')}`;
     case 'gifts': return `gifts ${t.events.map((e) => `${who(e.user)} ${e.giftName}×${e.count}`).join(', ')}${t.more ? ` +${t.more}` : ''}`;
+    case 'support': return `support ${t.likes.map((e) => `${who(e.user)} 赞×${e.count}`).join(', ')} ${t.shares.map((e) => `${who(e.user)} 分享`).join(', ')}`;
     case 'trend': return `trend「${t.key}」×${t.users}人 ${t.samples.join(' / ')}`;
     case 'welcome': return `welcome ${t.users.map(who).join(', ')}${t.more ? ` +${t.more}` : ''}`;
     case 'follow': return `follow ${t.users.map(who).join(', ')}`;
@@ -135,6 +136,85 @@ describe('attention rules', () => {
     a.observe(gift(2, 0), false, 0);
     a.observe(gift(10, 1000), true, 1000);
     expect(a.next(5000)?.kind).toBe('thanks');
+  });
+
+  it('batches likes and shares with their real counts', () => {
+    const a = new LiveAttention(0);
+    a.observe({ id: 'l1', platform: 'douyin', kind: 'like', ts: 0, user: user('1'), count: 2 }, false, 0);
+    a.observe({ id: 'l2', platform: 'douyin', kind: 'like', ts: 500, user: user('1'), count: 3 }, false, 500);
+    a.observe({ id: 's1', platform: 'bilibili', kind: 'share', ts: 800, user: user('2') }, false, 800);
+    expect(a.next(2_000)).toBeNull();
+    const topic = a.next(3_100);
+    expect(topic?.kind).toBe('support');
+    if (topic?.kind !== 'support') return;
+    expect(topic.likes).toHaveLength(1);
+    expect(topic.likes[0]).toMatchObject({ count: 5, user: { id: '1' } });
+    expect(topic.shares).toHaveLength(1);
+    expect(topic.overflow).toBe(false);
+  });
+
+  it('keeps a like storm bounded and covers overflow collectively', () => {
+    const a = new LiveAttention(0);
+    for (let index = 0; index < 2_000; index += 1) {
+      a.observe({ id: `l${index}`, platform: 'bilibili', kind: 'like', ts: index, user: user(String(index % 100)) }, false, index);
+    }
+    expect(a.snapshot(2_000).pending.support).toBeLessThanOrEqual(TUNING.maxSupportUsers + 1);
+    const topic = a.next(3_100);
+    expect(topic?.kind).toBe('support');
+    if (topic?.kind !== 'support') return;
+    expect(topic.likes.length).toBeLessThanOrEqual(3);
+    expect(topic.overflow).toBe(true);
+    expect(a.snapshot(3_100).pending.support).toBe(0);
+  });
+
+  it('does not expire a small free gift before it can be thanked', () => {
+    const a = new LiveAttention(0);
+    a.observe({ id: 'free', platform: 'bilibili', kind: 'gift', ts: 0, user: user('1'), giftName: '小心心', count: 1, valueYuan: 0 }, false, 0);
+    const topic = a.next(4 * 60_000);
+    expect(topic?.kind).toBe('gifts');
+    expect(topic?.kind === 'gifts' && topic.events[0].id).toBe('free');
+  });
+
+  it('thanks a free gift even when the room is not quiet', () => {
+    const a = new LiveAttention(0);
+    for (let index = 0; index < 10; index += 1) a.observe(chat(`c${index}`, String(index), `问题${index}：今天怎么玩？`), false, 0);
+    a.observe({ id: 'free', platform: 'bilibili', kind: 'gift', ts: 0, user: user('gift'), giftName: '小心心', count: 1, valueYuan: 0 }, false, 0);
+    const topics = Array.from({ length: 12 }, () => a.next(4_000));
+    expect(topics.some((topic) => topic?.kind === 'gifts')).toBe(true);
+  });
+
+  it('ignores a late duplicate of an acknowledged combo', () => {
+    const a = new LiveAttention(0);
+    const gift: LiveEvent = { id: 'g1', platform: 'douyin', kind: 'gift', ts: 0, user: user('1'), giftName: '玫瑰', count: 3, valueYuan: 0.3, cumulative: true };
+    a.observe(gift, false, 0);
+    const topic = a.next(3_100);
+    expect(topic?.kind).toBe('gifts');
+    if (!topic) return;
+    a.acknowledge(topic, 3_100);
+    a.observe({ ...gift, ts: 4_000 }, true, 4_000);
+    expect(a.next(5_000)).toBeNull();
+  });
+
+  it('thanks only the new increment when an acknowledged combo grows again', () => {
+    const a = new LiveAttention(0);
+    const gift = (count: number, ts: number): LiveEvent => ({
+      id: 'g1', platform: 'douyin', kind: 'gift', ts, user: user('1'), giftName: '玫瑰',
+      count, valueYuan: count / 10, diamonds: count, cumulative: true,
+    });
+    a.observe(gift(3, 0), false, 0);
+    const first = a.next(3_100);
+    expect(first?.kind).toBe('gifts');
+    if (!first) return;
+    a.acknowledge(first, 3_100);
+    a.observe(gift(3, 3_500), true, 3_500); // 已播快照，不重复感谢
+    a.observe(gift(5, 4_000), true, 4_000); // 同一连击又增加了两个
+    const second = a.next(7_100);
+    expect(second?.kind).toBe('gifts');
+    if (second?.kind !== 'gifts') return;
+    expect(second.events[0]).toMatchObject({ count: 2, valueYuan: 0.2, diamonds: 2 });
+    a.acknowledge(second, 7_100);
+    a.observe(gift(5, 7_500), true, 7_500);
+    expect(a.next(10_600)).toBeNull();
   });
 
   it('uses Douyin fans-club levels and terminology instead of the Bilibili medal threshold', () => {

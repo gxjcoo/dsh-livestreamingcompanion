@@ -22,6 +22,12 @@ export interface ChatPick {
   score: number;
 }
 
+/** 一批点赞/分享里要点名的人；count 来自平台事件，缺省事件已按 1 次计入。 */
+export interface SupportEntry {
+  user: LiveUser;
+  count: number;
+}
+
 export type TopicBody =
   /** 醒目留言：单独念、单独回 */
   | { kind: 'superchat'; event: LiveSuperChatEvent }
@@ -29,6 +35,8 @@ export type TopicBody =
   | { kind: 'thanks'; events: Array<LiveGiftEvent | LiveMembershipEvent> }
   /** 小礼物：攒一批一起谢；more 是没点名的人数 */
   | { kind: 'gifts'; events: LiveGiftEvent[]; more: number }
+  /** 点赞和分享：按人合并，overflow 用集体感谢覆盖，不虚构溢出人数 */
+  | { kind: 'support'; likes: SupportEntry[]; shares: SupportEntry[]; overflow: boolean }
   | { kind: 'chat'; picks: ChatPick[] }
   /** 很多人在刷同一句 */
   | { kind: 'trend'; key: string; samples: string[]; users: number }

@@ -5,6 +5,7 @@ import { decodePushFrame, type DouyinContext } from '../src/core/platforms/douyi
 import { parseDouyinRoom } from '../src/core/platforms/douyin/douyinApi';
 import { cookieReport, douyinSearchText, parseDouyinVideo, parseSearch, searchQuery } from '../src/body/douyinVideo';
 import type { LiveEvent } from '../src/core/live';
+import { LiveHub } from '../src/core/hub';
 import { gzipSync } from 'zlib';
 
 const FIXTURES = path.join(__dirname, 'fixtures', 'douyin');
@@ -52,11 +53,27 @@ function frame(messages: Buffer[], opts: { gzip?: boolean; type?: string } = {})
   return Buffer.concat(parts);
 }
 
-function giftMessage(input: { userId: string; name: string; giftId: number; repeat: number; group: string; diamond: number }): Buffer {
+function giftMessage(input: { userId: string; name: string; giftId: number; repeat: number; group: string; diamond: number; msgId?: number }): Buffer {
   const user = Buffer.concat([n(1, Number(input.userId)), s(3, input.name)]);
   const gift = Buffer.concat([s(2, '小心心'), n(12, input.diamond)]);
-  const body = Buffer.concat([n(2, input.giftId), n(5, input.repeat), field(7, 2, user), n(9, 1), field(11, 2, Buffer.from(input.group, 'utf8')), field(15, 2, gift)]);
+  const body = Buffer.concat([
+    ...(input.msgId ? [field(1, 2, n(2, input.msgId))] : []),
+    n(2, input.giftId), n(5, input.repeat), field(7, 2, user), n(9, 1),
+    field(11, 2, Buffer.from(input.group, 'utf8')), field(15, 2, gift),
+  ]);
   return Buffer.concat([s(1, 'WebcastGiftMessage'), field(2, 2, body)]);
+}
+
+function likeMessage(input: { userId: string; name: string; count: number; total: number; msgId: number }): Buffer {
+  const user = Buffer.concat([n(1, Number(input.userId)), s(3, input.name)]);
+  const body = Buffer.concat([field(1, 2, n(2, input.msgId)), n(2, input.count), n(3, input.total), field(5, 2, user)]);
+  return Buffer.concat([s(1, 'WebcastLikeMessage'), field(2, 2, body)]);
+}
+
+function shareMessage(input: { userId: string; name: string; msgId: number }): Buffer {
+  const user = Buffer.concat([n(1, Number(input.userId)), s(3, input.name)]);
+  const body = Buffer.concat([field(1, 2, n(2, input.msgId)), field(2, 2, user), n(3, 3)]);
+  return Buffer.concat([s(1, 'WebcastSocialMessage'), field(2, 2, body)]);
 }
 
 function chatMessage(input: { userId: string; name: string; honorLevel: number; clubName: string; clubLevel: number }): Buffer {
@@ -153,6 +170,41 @@ describe('douyin framing', () => {
     const id2 = again?.type === 'event' ? again.event.id : '';
     expect(id2).toBe(id1);
     expect(again?.type === 'event' && again.event.kind === 'gift' ? again.event.diamonds : 0).toBe(20);
+  });
+
+  it('keeps per-message like counts and replay-stable like/share ids', () => {
+    const like = frame([likeMessage({ userId: '42', name: '小明', count: 7, total: 70, msgId: 9001 })]);
+    const first = decodePushFrame(like, CTX, 1);
+    const replay = decodePushFrame(like, CTX, 2);
+    const event = first.find((output) => output.type === 'event' && output.event.kind === 'like');
+    const repeated = replay.find((output) => output.type === 'event' && output.event.kind === 'like');
+    expect(event?.type === 'event' ? event.event : null).toMatchObject({ kind: 'like', count: 7 });
+    expect(first.find((output) => output.type === 'stats')).toMatchObject({ stats: { likes: 70 } });
+    expect(event?.type === 'event' && repeated?.type === 'event' ? repeated.event.id : '').toBe(event?.type === 'event' ? event.event.id : 'missing');
+
+    const share = frame([shareMessage({ userId: '42', name: '小明', msgId: 9002 })]);
+    const a = decodePushFrame(share, CTX, 1).find((output) => output.type === 'event');
+    const b = decodePushFrame(share, CTX, 2).find((output) => output.type === 'event');
+    expect(a?.type === 'event' ? a.event.kind : '').toBe('share');
+    expect(a?.type === 'event' && b?.type === 'event' ? b.event.id : '').toBe(a?.type === 'event' ? a.event.id : 'missing');
+  });
+
+  it('feeds cumulative gift snapshots through the hub without double counting', () => {
+    const hub = new LiveHub(() => ({ platform: 'douyin', start() {}, stop() {} }));
+    const input = { userId: '42', name: '小明', giftId: 5655, group: 'g1', diamond: 5 };
+    const frames = [
+      frame([giftMessage({ ...input, repeat: 1, msgId: 101 })]),
+      frame([giftMessage({ ...input, repeat: 3, msgId: 102 })]),
+    ];
+    const seen: number[] = [];
+    hub.subscribe((event) => { if (event.kind === 'gift') seen.push(event.count); });
+    for (const [index, raw] of [...frames, frames[1]].entries()) {
+      for (const output of decodePushFrame(raw, CTX, index + 1)) {
+        if (output.type === 'event') hub.ingest(output.event, index + 1);
+      }
+    }
+    expect(seen).toEqual([1, 3]);
+    expect(hub.recentEvents()[0]).toMatchObject({ count: 3, diamonds: 15, valueYuan: 1.5, cumulative: true });
   });
 });
 
