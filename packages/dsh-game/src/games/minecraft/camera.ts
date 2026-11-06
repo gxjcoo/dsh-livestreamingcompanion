@@ -146,7 +146,8 @@ export class CameraClient {
       root: o.root,
       version: { number: o.version, type: 'release' },
       authorization: await Authenticator.getAuth(o.username),
-      memory: { max: '2G', min: '1G' },
+      memory: { max: '4G', min: '2G' },
+      customArgs: ['-XX:+UseZGC'],
       javaPath: o.java,
       // 工作目录也放摄像机自己的目录：游戏的日志写在工作目录下，别写进主人的 .minecraft
       overrides: { gameDirectory: o.gameDir, cwd: o.gameDir, detached: false },
