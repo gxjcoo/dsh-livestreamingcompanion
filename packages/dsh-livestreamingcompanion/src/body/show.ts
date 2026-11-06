@@ -136,6 +136,8 @@ const WATCH_MIN_SEC = 8;
 const GAME_PUSH_GAP_MS = 15_000;
 /** 她在玩游戏、这一轮停下了、话也说完了，等这么久直播间还没事，就叫她接着玩 */
 const GAME_WAKE_MS = 6_000;
+/** 玩游戏时直播线多久可以给一次「自己找话说」（换换节奏：放个视频、聊两句） */
+const LIVE_IDLE_GAP_MS = 4 * 60_000;
 /** 她在玩游戏时，欢迎新观众至少隔这么久（攒成一句一起欢迎） */
 const GAME_WELCOME_GAP_MS = 90_000;
 /** 她在玩游戏时，一次推给她的弹幕至少可以有几位观众的（攒了一阵的弹幕一句话一起回） */
@@ -186,6 +188,8 @@ export class LiveShow {
   private gameTurnRunning = false;
   private gameTurnEndedAt = 0;
   private gamePushing = false;
+  /** 玩游戏时上一次给直播线「自己找话说」的时间（放个视频、换换节奏） */
+  private lastLiveIdleAt = 0;
   /** 要交给游戏线的话（直播线定下的事、续播），导演一条一条送 */
   private gameMail: string[] = [];
   /** 游戏那边现在怎样（游戏线最近一个时刻的进度和身体在干什么）：写进给直播线的每件事里 */
@@ -634,7 +638,22 @@ export class LiveShow {
     const body = this.priority.shift();
     if (body) return { ...body, id: `p-${now}`, priority: 200, heat: this.attention.heat(now), createdAt: now };
     const topic = this.attention.next(now);
-    return topic && topic.kind !== 'idle' ? topic : null;
+    if (!topic) return null;
+    if (topic.kind !== 'idle') return topic;
+    // 玩游戏的时候平常不给她「自己找话说」，省得她一直刷视频不玩；
+    // 但闷久了也该换个节奏（放个视频、跟观众聊两句），不然一整晚只有游戏画面。
+    // 第一次进来只记时间（lastLiveIdleAt=0 时不能直接放），四分钟后才给一次。
+    if (this.gameOn) {
+      if (this.lastLiveIdleAt === 0) {
+        this.lastLiveIdleAt = now;
+        return null;
+      }
+      if (now - this.lastLiveIdleAt > LIVE_IDLE_GAP_MS) {
+        this.lastLiveIdleAt = now;
+        return topic;
+      }
+    }
+    return null;
   }
 
   /** 在玩游戏、这一轮停下了：直播间有事先回；没事、又安静了一会儿，叫她接着玩（不另找话题、不推视频和收件箱） */

@@ -168,8 +168,8 @@ function body(topic: Topic, ctx: TopicContext): Body {
       };
     case 'game':
       return {
-        what: ['你在直播里开着的游戏还在进行，画面在舞台上，观众在看。'],
-        how: '接着用 game_continue 看看游戏里怎么样了。',
+        what: ['你在直播里开着的游戏还在进行，舞台上是游戏画面，观众在看。这会儿没有别的事，轮到你自己玩。'],
+        how: '别站着干等、也别只用 game_continue 看：先定一件具体的小事，用 game_act 去做（砍树 / 挖矿 / 盖房子 / 找吃的 / 天黑就做火把），做完再看游戏里怎么样了。',
         maxChars: 40,
       };
     case 'inbox':
@@ -199,7 +199,7 @@ function body(topic: Topic, ctx: TopicContext): Body {
       // 话痨模式：冷场本来就是常态，让她接着往下说，别一句就把话头放掉
       return ctx.chatty
         ? { what: ['直播间这会儿没人发弹幕，你一个人在说。'], how: '接着说两三句，别问完就停：讲一件你作为 AI 的真实小事、吐槽一下刚才自己做的事、或者说说接下来想干什么。上一句说过的别重复，也别每次都用同一个开头。', maxChars: 110 }
-        : { what: ['直播间这会儿没人发弹幕。'], how: '自己找点话说：讲一件你作为 AI 的真实小事，问观众一个具体、好回答的问题，或者找个 B 站视频放给大家一起看。', maxChars: 70 };
+        : { what: ['直播间这会儿没人发弹幕。'], how: '自己找点话说：讲一件你作为 AI 的真实小事，问观众一个具体、好回答的问题，或者搜个抖音视频放给大家一起看（douyin_search 挑一条，play_douyin_video 放上舞台）。', maxChars: 70 };
   }
 }
 

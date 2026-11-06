@@ -271,6 +271,8 @@ export class MinecraftSession implements GameSession {
   private lastPhase: string | null = null;
   /** 上一次提醒「太暗又没火把」的时间：按位置记会随走路每格重报一次，这里是整局限流 */
   private lastDarkNoticeAt = 0;
+  /** 夜里「没火把」轮换提示的序号：老说同一句她就不动了，换着花样给可做的事 */
+  private darkNoticeSeq = -1;
   private seenHostiles = new Set<string>();
   private nudged = false;
   private firstMoment = true;
@@ -1466,10 +1468,17 @@ export class MinecraftSession implements GameSession {
       || this.queue.some((item) => item.bodyAction === 'craft_item' && item.args.item === 'torch');
     const torches = body.inventory.torch ?? body.inventory['minecraft:torch'] ?? 0;
     if (torches < 1) {
-      // 整局限流：以前按位置记，走一格就重报一次，一个时刻里能塞进四句一样的话
+      // 整局限流：以前按位置记，走一格就重报一次，一个时刻里能塞进四句一样的话。
+      // 而且以前每次都只说「躲起来等天亮」——她就真的在洞里干等，一动不动。
       if (!torchSupplyRunning && now - this.lastDarkNoticeAt > 60_000) {
         this.lastDarkNoticeAt = now;
-        this.push('当前位置太暗，而且背包里没有火把：别摸黑干活——先躲起来等天亮（hide），或者回去捡回掉落的火把。', true);
+        const nudges = [
+          '天还黑着、洞里很暗，没有火把。别干等天亮：现在能做的是合成（工作台 / 木板 / 工具）、烧东西（熔炉）、或者挖一条矿道找煤——挑一件用 game_act 去做。',
+          '还是黑的。要不先把木头做成木板、木板做工作台和木棍；有煤或木炭就做火把，没有就顺着矿道往下挖找煤。别只 game_continue 等着。',
+          '夜里也能干活：把背包整理一下、把该合成的合了、挖矿攒石头；等天亮了再出去砍树盖房。',
+        ];
+        this.darkNoticeSeq = (this.darkNoticeSeq + 1) % nudges.length;
+        this.push(nudges[this.darkNoticeSeq], true);
       }
       this.rememberLightingMaintenance(key, { attempts: 0, nextAt: now + 60_000, exhaustionNotified: false });
       return;
