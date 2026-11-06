@@ -36,8 +36,9 @@ describe('playing a game on stream', () => {
     const waiting = new AbortController();
     let woke = false;
     void show.waitAttention(waiting.signal).then(() => { woke = true; });
-    await vi.advanceTimersByTimeAsync(4 * 60_000);
-    expect(pushed).toHaveLength(1); // 只有开场：玩游戏的时候不找话说，也不当她卡住
+    // 只推进 10 秒：还没到「自己找话说」的 30 秒间隔，这一小段只该有开场
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(pushed).toHaveLength(1);
     expect(woke).toBe(false);
     show.inject(chat('1', '挖到钻石了吗'));
     await vi.advanceTimersByTimeAsync(6_000);
